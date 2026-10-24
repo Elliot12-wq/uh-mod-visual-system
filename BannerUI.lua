@@ -72,12 +72,10 @@ return function(Env)
 		L.rr.BackgroundColor3 = a:Lerp(BLACK, math.max(0.05, 0.3 - 0.22 * s))
 	end
 
-	-- ban hammer icon (two rotated bars) for the owner / co-owner blacklist button
-	local function hammer(par, z)
-		new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(3, 17), Position = UDim2.fromOffset(13.5, 16.5), Rotation = 45, BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = z}, par)
-		local head = new("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(15, 7), Position = UDim2.fromOffset(18.5, 11.5), Rotation = 45, BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = z + 1}, par)
-		round(head, UDim.new(0, 2))
-	end
+	-- inline moderation buttons beside the card (Kill / Deanimate / Kick / Ban). The receiver decides WHO gets which buttons (o.acts);
+	-- this file only draws them and hit-tests them. Layout: a 2-column grid of pills, two rows = about the height of the card.
+	-- Slot i (1-based): column (i-1) % ACOLS, row floor((i-1) / ACOLS). Up to 4 buttons fit beside the card.
+	local AW, AH, AG, AX, AY, ACOLS = 68, 28, 6, 10, 1, 2 -- pill width / height, gap, offset from the card's right edge, offset from the card's top, columns
 
 	local function step()
 		local now = os.clock()
@@ -97,7 +95,10 @@ return function(Env)
 		local bg = cardBG()
 		local W = (role and role.tag) and 316 or 250
 		local self = setmetatable({Opts = o, Seed = math.random() * 10, Alive = true, FX = {}, Spark = {}, LastBG = os.clock(), Role = role, RoleColor = role and role.color, W = W}, Banner)
-		local gui = new("BillboardGui", {Name = "UhBanner_" .. tostring(o.userId), AlwaysOnTop = true, Size = UDim2.fromOffset(W + 10 + ((o.canBan and not role) and 100 or 0), 150),
+		-- inline action buttons: only ever on plain (unverified) banners; verified / owner / co-owner banners never get them
+		local acts = (not role and type(o.acts) == "table" and #o.acts > 0) and o.acts or nil
+		local extra = acts and 2 * (AX + math.min(#acts, ACOLS) * (AW + AG) + 4) or 0 -- the gui is centred on the card, so reserve the room on both sides
+		local gui = new("BillboardGui", {Name = "UhBanner_" .. tostring(o.userId), AlwaysOnTop = true, Size = UDim2.fromOffset(W + 10 + extra, 150),
 			StudsOffset = Vector3.new(0, 1.7, 0), MaxDistance = 150, LightInfluence = 0, ResetOnSpawn = false,
 			ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Enabled = false}, host())
 		local holder = new("Frame", {Name = "Holder", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.5),
@@ -153,12 +154,18 @@ return function(Env)
 					Font = Enum.Font.GothamBlack, TextSize = 12, TextColor3 = a:Lerp(WHITE, 0.35), ZIndex = 4, LayoutOrder = 2}, chip)
 			end
 		end
-		if o.canBan and not role then -- owner / co-owner only: ban hammer beside the card (clicks are handled by the receiver via Banner:HitHammer)
-			local hb = new("Frame", {Name = "Hammer", Position = UDim2.new(1, 10, 0, 17), Size = UDim2.fromOffset(30, 30), BackgroundColor3 = Color3.fromRGB(200, 60, 60), BorderSizePixel = 0, ZIndex = 3}, holder)
-			round(hb, UDim.new(1, 0))
-			new("UIStroke", {Thickness = 2, Color = a}, hb)
-			hammer(hb, 4)
-			self.Hammer = hb
+		if acts then -- moderator buttons beside the card (clicks are handled by the receiver via Banner:HitAction)
+			self.ActBtn = {}
+			for i, ac in ipairs(acts) do
+				local col, row = (i - 1) % ACOLS, math.floor((i - 1) / ACOLS)
+				local pill = new("Frame", {Name = "Act_" .. tostring(ac.key), Position = UDim2.new(1, AX + col * (AW + AG), 0, AY + row * (AH + AG)), Size = UDim2.fromOffset(AW, AH),
+					BackgroundColor3 = ac.color, BorderSizePixel = 0, ZIndex = 3}, holder)
+				round(pill, UDim.new(0, 9))
+				new("UIStroke", {Thickness = 1.5, Color = a}, pill)
+				local lbl = new("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = tostring(ac.label), Font = Enum.Font.GothamBold,
+					TextSize = 12, TextColor3 = WHITE, ZIndex = 4}, pill)
+				self.ActBtn[ac.key] = {Frame = pill, Label = lbl, Color = ac.color, Text = tostring(ac.label), Col = col, Row = row}
+			end
 		end
 		for i = 1, 4 do
 			local s = new("Frame", {Size = UDim2.fromOffset(4, 4), BackgroundColor3 = a, BorderSizePixel = 0, ZIndex = 5}, holder)
@@ -226,16 +233,35 @@ return function(Env)
 		return math.abs(p.X - v.X) <= self.W / 2 * s and p.Y >= v.Y - 78 * s and p.Y <= v.Y - 14 * s
 	end
 
-	function Banner:HitHammer(p) -- p = point in viewport coordinates
-		if not self.Hammer then return false end
+	function Banner:HitAction(p) -- p = point in viewport coordinates; returns the key of the inline button under p (or nil)
+		if not self.ActBtn then return nil end
 		local cam, part = workspace.CurrentCamera, self.Gui.Adornee
-		if not (self.Alive and self.Shown and cam and part and self.Gui.Enabled) then return false end
-		if (cam.CFrame.Position - part.Position).Magnitude > self.Gui.MaxDistance then return false end
+		if not (self.Alive and self.Shown and cam and part and self.Gui.Enabled) then return nil end
+		if (cam.CFrame.Position - part.Position).Magnitude > self.Gui.MaxDistance then return nil end
 		local v, on = cam:WorldToViewportPoint(part.Position + cam.CFrame.UpVector * self.Gui.StudsOffset.Y)
-		if not on then return false end
+		if not on then return nil end
 		local s = self.Scale.Scale
-		local x0, y0 = v.X + (self.W / 2 + 10) * s, v.Y - 61 * s
-		return p.X >= x0 - 4 and p.X <= x0 + 34 * s and p.Y >= y0 - 4 and p.Y <= y0 + 34 * s
+		for key, b in pairs(self.ActBtn) do
+			-- holder is anchored bottom-centre on the gui centre (v) and is 78 tall: its right edge is v.X + W/2, its top is v.Y - 78
+			local x0 = v.X + (self.W / 2 + AX + b.Col * (AW + AG)) * s
+			local y0 = v.Y + (AY + b.Row * (AH + AG) - 78) * s
+			if p.X >= x0 - 3 and p.X <= x0 + (AW + 3) * s and p.Y >= y0 - 3 and p.Y <= y0 + (AH + 3) * s then return key end
+		end
+		return nil
+	end
+
+	function Banner:SetAction(key, text, color) -- re-label / recolour one inline button (e.g. "Sure?"); no args = back to normal
+		local b = self.ActBtn and self.ActBtn[key]
+		if not (self.Alive and b) then return end
+		b.Label.Text = text or b.Text
+		b.Frame.BackgroundColor3 = color or b.Color
+	end
+
+	function Banner:PulseAction(key) -- click feedback
+		local b = self.ActBtn and self.ActBtn[key]
+		if not (self.Alive and b) then return end
+		b.Frame.BackgroundTransparency = 0.55
+		TS:Create(b.Frame, TweenInfo.new(0.3), {BackgroundTransparency = 0}):Play()
 	end
 
 	function Banner:_step(now, a, s2, low)

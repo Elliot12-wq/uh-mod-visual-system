@@ -44,16 +44,38 @@ return function(Env, UI)
 		end
 		return thumbs[uid]
 	end
+	-- Inline moderation buttons drawn beside a banner (order = grid order in BannerUI). `mod` = verified moderators + owner / co-owner (kill / deanimate / kick,
+	-- relayed through ModTools); `ban` = owner / co-owner only (blacklist). Same rights as the tap-a-banner menu, just one tap closer.
+	local ACTS = {
+		{key = "kill", label = "Kill", color = Color3.fromRGB(214, 92, 48), mod = true},
+		{key = "deanimate", label = "Deanimate", color = Color3.fromRGB(96, 110, 210), mod = true},
+		{key = "kick", label = "Kick", color = Color3.fromRGB(196, 146, 38), mod = true},
+		{key = "ban", label = "Ban", color = Color3.fromRGB(190, 50, 60), ban = true},
+	}
+	local function actionsFor(uid) -- the buttons THIS viewer may use on that player's banner; nothing on yourself, and nothing on verified / owner / co-owner (they are immune)
+		if uid == Env.Player.UserId or rawRole(uid) then return nil end
+		local mod = R.CanModerate and R.CanModerate()
+		local bl = R.CanBlacklist and R.CanBlacklist()
+		local list = {}
+		for _, a in ipairs(ACTS) do
+			if (a.mod and mod) or (a.ban and bl) then list[#list + 1] = a end
+		end
+		if #list == 0 then return nil end
+		return list
+	end
 	local function sanitize(uid, d)
 		local img = tostring(d.image or "")
 		if img:match("^%d+$") then img = "rbxassetid://" .. img elseif not img:match("^rbxassetid://%d+$") then img = "" end
 		if img == "" then img = headshot(uid) end
 		local name = clean(d.name, 40)
 		local title = clean(d.title, 40)
+		local acts = actionsFor(uid)
+		local keys = {}
+		for _, a in ipairs(acts or {}) do keys[#keys + 1] = a.key end
 		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img, role = roleOf(uid),
-			canBan = (R.CanBlacklist and R.CanBlacklist() and not rawRole(uid) and uid ~= Env.Player.UserId) and true or false}
+			acts = acts, actKey = table.concat(keys, ",")}
 	end
-	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") .. "|" .. (o.canBan and "b" or "") end
+	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") .. "|" .. o.actKey end
 
 	local function targetPart(uid)
 		local char
@@ -82,9 +104,10 @@ return function(Env, UI)
 				local o = sanitize(uid, d)
 				local e = R.Banners[uid]
 				if not e then
-					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, Ban = o.canBan}
-				elseif e.Role ~= o.role or e.Ban ~= o.canBan then -- rank / ban-hammer rights changed (username just resolved): rebuild
-					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, Ban = o.canBan}
+					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, ActKey = o.actKey}
+				elseif e.Role ~= o.role or e.ActKey ~= o.actKey then -- rank / moderation rights changed (username just resolved, key redeemed): rebuild
+					R.DisarmKick()
+					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, ActKey = o.actKey}
 				elseif e.Sig ~= sig(o) then
 					e.UI:Update(o); e.Sig = sig(o)
 				end
@@ -181,14 +204,44 @@ return function(Env, UI)
 		end
 	end
 
-	-- ban hammer next to a banner: Yes/No warning -> blacklist (owner / co-owner only); the blacklisted client kicks itself
-	function R.OnHammer(uid)
-		if not R.CanBlacklist() or rawRole(uid) or uid == Env.Player.UserId then return end
-		local p = Players:GetPlayerByUserId(uid)
-		if not p then return end
+	-- inline buttons next to a banner (Kill / Deanimate / Kick / Ban). Permissions are re-checked at click time, so a stale button can never do more than the
+	-- viewer is allowed to: Kill / Deanimate / Kick go through ModTools.Send (the backend checks the moderator key again), Ban goes through the Yes/No
+	-- blacklist dialog (owner / co-owner only; the blacklisted client kicks itself). Kick needs a second tap ("Sure?") so a stray tap can't remove someone.
+	local kickArm -- {uid, expires} while a Kick button is waiting for its confirming tap
+	function R.DisarmKick()
+		local a = kickArm
+		kickArm = nil
+		local e = a and R.Banners[a.uid]
+		if e then e.UI:SetAction("kick") end
+	end
+	function R.OnAction(uid, key)
+		local p, e = Players:GetPlayerByUserId(uid), R.Banners[uid]
+		if not (p and e) then return end
+		local allowed
+		for _, a in ipairs(actionsFor(uid) or {}) do if a.key == key then allowed = a end end
+		if not allowed then return end
 		R.CloseMenu()
-		Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
-			toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
+		if key == "ban" then
+			e.UI:PulseAction(key)
+			return Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
+				toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
+			end)
+		end
+		if key == "kick" and not (kickArm and kickArm.uid == uid and os.clock() < kickArm.expires) then -- first tap: arm the button, don't send anything yet
+			R.DisarmKick()
+			local arm = {uid = uid, expires = os.clock() + 2.5}
+			kickArm = arm
+			e.UI:SetAction("kick", "Sure?", Color3.fromRGB(190, 50, 60))
+			task.delay(2.6, function() if kickArm == arm then R.DisarmKick() end end)
+			return
+		end
+		if os.clock() - (R.LastAct or 0) < 1.6 then return toast("slow down a little", "Moderator") end -- the backend allows one command per ~1.5 s per moderator (an armed Kick stays armed)
+		if key == "kick" then R.DisarmKick() end -- second tap within 2.5 s: confirmed
+		R.LastAct = os.clock()
+		e.UI:PulseAction(key)
+		task.spawn(function()
+			local ok, err = Env.Mod.Send(uid, key)
+			toast(ok and (allowed.label .. ": " .. p.Name) or ("failed: " .. tostring(err)), "Moderator")
 		end)
 	end
 
@@ -211,7 +264,8 @@ return function(Env, UI)
 				local pt = Vector2.new(i.Position.X, i.Position.Y) + Env.GuiService:GetGuiInset()
 				for uid, e in pairs(R.Banners) do
 					if uid ~= Env.Player.UserId then
-						if e.Ban and e.UI:HitHammer(pt) then return R.OnHammer(uid) end
+						local key = e.ActKey ~= "" and e.UI:HitAction(pt) -- inline moderation buttons beside the banner
+						if key then return R.OnAction(uid, key) end
 						if e.UI:Contains(pt) then return R.OnBannerClick(uid, pt) end
 					end
 				end
