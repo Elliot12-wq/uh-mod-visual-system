@@ -8,7 +8,7 @@ return function(Env, UI)
 	-- tag = rank chip text, logo = rotating 3D triangle, color = accent override. An entry of {} = plain verified (check badge only).
 	local VERIFIED = {
 		kingbaconnon19 = {tag = "OWNER", logo = true, color = Color3.fromRGB(255, 190, 50)},
-		hellii129 = {tag = "CO-OWNER", color = Color3.fromRGB(170, 120, 255)},
+		helloman1_23 = {tag = "CO-OWNER", color = Color3.fromRGB(170, 120, 255)},
 		-- moderator whitelist (plain "Verified" banner, check badge only; they can kick / kill / deanimate misusing script users).
 		-- A whitelisted account only becomes Verified after it redeems a one-time key in the main UI ("VERIFIED KEY"). One per line, lower-case username:
 		-- exampleusername = {},

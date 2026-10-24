@@ -4,7 +4,7 @@
 -- A blacklisted client kicks itself: "BLACKLISTED by the owner / co-owner" (checked at startup + every few seconds by B.Watch)
 return function(Env)
 	local B = {List = {}}
-	local ROLE_BY_NAME = {kingbaconnon19 = "owner", hellii129 = "co-owner"}
+	local ROLE_BY_NAME = {kingbaconnon19 = "owner", helloman1_23 = "co-owner"}
 
 	function B.Fetch()
 		local ok, body = pcall(function() return game:HttpGet(Env.Base .. "blacklist.json?t=" .. os.time()) end)
