@@ -9,6 +9,9 @@ return function(Env, UI)
 	local VERIFIED = {
 		kingbaconnon19 = {tag = "OWNER", logo = true, color = Color3.fromRGB(255, 190, 50)},
 		hellii129 = {tag = "CO-OWNER", color = Color3.fromRGB(170, 120, 255)},
+		-- moderator whitelist (plain "Verified" banner, check badge only; they can kick / kill / deanimate misusing script users).
+		-- A whitelisted account only becomes Verified after it redeems a one-time key in the main UI ("VERIFIED KEY"). One per line, lower-case username:
+		-- exampleusername = {},
 	}
 	local roleIds, resolved = {}, {}
 	for name, r in pairs(VERIFIED) do
@@ -17,13 +20,22 @@ return function(Env, UI)
 			if ok and id then roleIds[id] = r; resolved[name] = true end
 		end)
 	end
-	local function roleOf(uid)
+	local confirmed = {} -- userIds the backend says have redeemed a verified key (set from each /banners poll)
+	local function rawRole(uid) -- whitelisted by username (protected from kill / kick / blacklist), key or not
 		if roleIds[uid] then return roleIds[uid] end
 		local p = Players:GetPlayerByUserId(uid)
 		local n = p and p.Name:lower()
 		if n and VERIFIED[n] and not resolved[n] then return VERIFIED[n] end
 	end
+	local function roleOf(uid) -- OWNER / CO-OWNER always; plain "Verified" moderators only once their key is redeemed
+		local r = rawRole(uid)
+		if r and not r.tag and not confirmed[uid] then return nil end
+		return r
+	end
+	function R.IsWhitelisted(uid) return rawRole(uid) ~= nil end
+	function R.SetVerified(uid) confirmed[uid] = true end
 
+	R.RoleOf = roleOf
 	local function clean(s, n) return (tostring(s or ""):gsub("%c", "")):sub(1, n) end
 	local function headshot(uid)
 		if thumbs[uid] == nil then
@@ -38,9 +50,10 @@ return function(Env, UI)
 		if img == "" then img = headshot(uid) end
 		local name = clean(d.name, 40)
 		local title = clean(d.title, 40)
-		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img, role = roleOf(uid)}
+		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img, role = roleOf(uid),
+			canBan = (R.CanBlacklist and R.CanBlacklist() and not rawRole(uid) and uid ~= Env.Player.UserId) and true or false}
 	end
-	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") end
+	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") .. "|" .. (o.canBan and "b" or "") end
 
 	local function targetPart(uid)
 		local char
@@ -65,12 +78,13 @@ return function(Env, UI)
 			local uid = type(d) == "table" and tonumber(d.userId)
 			if uid and not seen[uid] and (uid == Env.Player.UserId or Players:GetPlayerByUserId(uid)) then
 				seen[uid] = true
+				confirmed[uid] = d.verified == true
 				local o = sanitize(uid, d)
 				local e = R.Banners[uid]
 				if not e then
-					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role}
-				elseif e.Role ~= o.role then -- rank changed (username just resolved): rebuild
-					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role}
+					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, Ban = o.canBan}
+				elseif e.Role ~= o.role or e.Ban ~= o.canBan then -- rank / ban-hammer rights changed (username just resolved): rebuild
+					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, Ban = o.canBan}
 				elseif e.Sig ~= sig(o) then
 					e.UI:Update(o); e.Sig = sig(o)
 				end
@@ -119,36 +133,62 @@ return function(Env, UI)
 		local r = roleOf(Env.Player.UserId)
 		return r and (r.tag == "OWNER" or r.tag == "CO-OWNER") and Env.Blacklist ~= nil and Env.OwnerKey ~= nil and Env.OwnerKey ~= ""
 	end
-	local function toast(msg)
-		pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", {Title = "Blacklist", Text = msg, Duration = 4}) end)
+	local function toast(msg, title)
+		pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", {Title = title or "Blacklist", Text = msg, Duration = 4}) end)
 	end
+	function R.CanModerate() return Env.Mod ~= nil and Env.Mod.CanModerate() end -- verified moderators + owner / co-owner
 	function R.OnBannerClick(uid, pt)
-		if not R.CanBlacklist() or roleOf(uid) then return R.Teleport(uid) end -- verified / owner banners just teleport
+		local mod, bl = R.CanModerate(), R.CanBlacklist()
+		if not (mod or bl) or rawRole(uid) then return R.Teleport(uid) end -- whitelisted / verified / owner banners (and everyone without rights) just teleport
 		local p = Players:GetPlayerByUserId(uid)
 		if not p then return end
 		R.CloseMenu()
+		local items = {{"Teleport", Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end}}
+		if mod then -- moderators: kick / kill / deanimate only (relayed to script users, never to verified players)
+			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}}) do
+				table.insert(items, {a[1], Color3.fromRGB(205, 125, 40), function()
+					task.spawn(function()
+						local ok, err = Env.Mod.Send(uid, a[2])
+						toast(ok and (a[1] .. ": " .. p.Name) or ("failed: " .. tostring(err)), "Moderator")
+					end)
+				end})
+			end
+		end
+		if bl then -- owner / co-owner only
+			table.insert(items, {"Blacklist", Color3.fromRGB(200, 60, 60), function()
+				Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
+					toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
+				end)
+			end})
+		end
+		local H = 8 + #items * 34
 		local gui = Instance.new("ScreenGui")
 		gui.Name, gui.ResetOnSpawn, gui.DisplayOrder, gui.IgnoreGuiInset = "UhBannerMenu", false, 900, true
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
 		menu = gui
 		local f = Instance.new("Frame", gui)
-		f.Size, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(150, 78), Color3.fromRGB(24, 24, 30), 0
+		f.Size, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(150, H), Color3.fromRGB(24, 24, 30), 0
 		local cam = workspace.CurrentCamera
 		local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-		f.Position = UDim2.fromOffset(math.clamp(pt.X, 0, vp.X - 150), math.clamp(pt.Y, 0, vp.Y - 78))
+		f.Position = UDim2.fromOffset(math.clamp(pt.X, 0, vp.X - 150), math.clamp(pt.Y, 0, vp.Y - H))
 		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
-		local function btn(txt, y, col, cb)
+		for i, it in ipairs(items) do
 			local b = Instance.new("TextButton", f)
-			b.Size, b.Position, b.Text = UDim2.fromOffset(134, 28), UDim2.fromOffset(8, y), txt
-			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = col, Color3.new(1, 1, 1), Enum.Font.GothamBold, 14
+			b.Size, b.Position, b.Text = UDim2.fromOffset(134, 28), UDim2.fromOffset(8, 8 + (i - 1) * 34), it[1]
+			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = it[2], Color3.new(1, 1, 1), Enum.Font.GothamBold, 14
 			Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-			b.Activated:Connect(function() R.CloseMenu(); cb() end)
+			b.Activated:Connect(function() R.CloseMenu(); it[3]() end)
 		end
-		btn("Teleport", 8, Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end)
-		btn("Blacklist", 42, Color3.fromRGB(200, 60, 60), function()
-			Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
-				toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
-			end)
+	end
+
+	-- ban hammer next to a banner: Yes/No warning -> blacklist (owner / co-owner only); the blacklisted client kicks itself
+	function R.OnHammer(uid)
+		if not R.CanBlacklist() or rawRole(uid) or uid == Env.Player.UserId then return end
+		local p = Players:GetPlayerByUserId(uid)
+		if not p then return end
+		R.CloseMenu()
+		Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
+			toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
 		end)
 	end
 
@@ -170,7 +210,10 @@ return function(Env, UI)
 				R.CloseMenu()
 				local pt = Vector2.new(i.Position.X, i.Position.Y) + Env.GuiService:GetGuiInset()
 				for uid, e in pairs(R.Banners) do
-					if uid ~= Env.Player.UserId and e.UI:Contains(pt) then return R.OnBannerClick(uid, pt) end
+					if uid ~= Env.Player.UserId then
+						if e.Ban and e.UI:HitHammer(pt) then return R.OnHammer(uid) end
+						if e.UI:Contains(pt) then return R.OnBannerClick(uid, pt) end
+					end
 				end
 			end))
 		end
