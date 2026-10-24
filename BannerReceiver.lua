@@ -111,6 +111,47 @@ return function(Env, UI)
 		if e then e.UI:Update(e.UI.Opts) end -- pulse feedback
 	end
 
+
+	-- owner / co-owner tools: clicking another script user's banner opens Teleport / Blacklist
+	local menu
+	function R.CloseMenu() if menu then menu:Destroy(); menu = nil end end
+	function R.CanBlacklist()
+		local r = roleOf(Env.Player.UserId)
+		return r and (r.tag == "OWNER" or r.tag == "CO-OWNER") and Env.Blacklist ~= nil and Env.OwnerKey ~= nil and Env.OwnerKey ~= ""
+	end
+	local function toast(msg)
+		pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", {Title = "Blacklist", Text = msg, Duration = 4}) end)
+	end
+	function R.OnBannerClick(uid, pt)
+		if not R.CanBlacklist() or roleOf(uid) then return R.Teleport(uid) end -- verified / owner banners just teleport
+		local p = Players:GetPlayerByUserId(uid)
+		if not p then return end
+		R.CloseMenu()
+		local gui = Instance.new("ScreenGui")
+		gui.Name, gui.ResetOnSpawn, gui.DisplayOrder, gui.IgnoreGuiInset = "UhBannerMenu", false, 900, true
+		gui.Parent = Env.Player:WaitForChild("PlayerGui")
+		menu = gui
+		local f = Instance.new("Frame", gui)
+		f.Size, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(150, 78), Color3.fromRGB(24, 24, 30), 0
+		local cam = workspace.CurrentCamera
+		local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+		f.Position = UDim2.fromOffset(math.clamp(pt.X, 0, vp.X - 150), math.clamp(pt.Y, 0, vp.Y - 78))
+		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+		local function btn(txt, y, col, cb)
+			local b = Instance.new("TextButton", f)
+			b.Size, b.Position, b.Text = UDim2.fromOffset(134, 28), UDim2.fromOffset(8, y), txt
+			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = col, Color3.new(1, 1, 1), Enum.Font.GothamBold, 14
+			Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+			b.Activated:Connect(function() R.CloseMenu(); cb() end)
+		end
+		btn("Teleport", 8, Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end)
+		btn("Blacklist", 42, Color3.fromRGB(200, 60, 60), function()
+			Env.Blacklist.Confirm(uid, p.Name, function(ok, err)
+				toast(ok and (p.Name .. " blacklisted") or ("failed: " .. tostring(err)))
+			end)
+		end)
+	end
+
 	function R.Start(localOnly)
 		if R.Running then return end
 		if not localOnly and not Env.Request then return warn("[UhBanner] executor has no request(); live sync unavailable") end
@@ -126,9 +167,10 @@ return function(Env, UI)
 			table.insert(conns, Env.UserInputService.InputBegan:Connect(function(i, gp)
 				local t = i.UserInputType
 				if gp or R.Hidden or (t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch) then return end
+				R.CloseMenu()
 				local pt = Vector2.new(i.Position.X, i.Position.Y) + Env.GuiService:GetGuiInset()
 				for uid, e in pairs(R.Banners) do
-					if uid ~= Env.Player.UserId and e.UI:Contains(pt) then return R.Teleport(uid) end
+					if uid ~= Env.Player.UserId and e.UI:Contains(pt) then return R.OnBannerClick(uid, pt) end
 				end
 			end))
 		end
@@ -147,6 +189,7 @@ return function(Env, UI)
 
 	function R.Stop()
 		R.Running = false
+		R.CloseMenu()
 		for _, c in ipairs(conns) do c:Disconnect() end
 		conns = {}
 		for uid, e in pairs(R.Banners) do e.UI:Destroy(false); R.Banners[uid] = nil end
