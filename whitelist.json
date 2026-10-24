@@ -1,5 +1,5 @@
 {
-  "_note": "Verified-player whitelist. Add one object per player to entries: {\"username\": \"Name\"} and/or {\"userId\": 123456}. Whitelisted players become plain Verified once they redeem their key. Owner / co-owner stay hardcoded in the script.",
+  "_note": "Verified-player whitelist. Add one object per player to entries: {\"username\": \"Name\"} and/or {\"userId\": 123456}. Whitelisted players are plain Verified straight away (no key needed), with moderator tools. Owner / co-owner stay hardcoded in the script.",
   "entries": [
     { "username": "Idkmanel8" }
   ]

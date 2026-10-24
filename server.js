@@ -7,30 +7,23 @@ const send = (res, code, body) => { res.writeHead(code, { "Content-Type": "appli
 const live = (room) => { const m = rooms.get(room) || {}, now = Date.now(); for (const k in m) if (m[k].exp < now) delete m[k]; return m; };
 setInterval(() => { for (const r of [...rooms.keys()]) if (!Object.keys(live(r)).length) rooms.delete(r); }, 15000).unref();
 
-// ---- moderator commands: kill / deanimate / kick, only against live script users, only from keyed moderators ----
-// MOD_KEYS env = JSON array of one-time keys, e.g. ["Nooby-...", "Nooby-..."]. A key locks to the FIRST userId that uses it and then works for that user only.
-// Claimed userIds are immune to commands. Claims are saved to mod_claims.json (best effort; some free hosts wipe files on restart).
+// ---- moderator commands: kill / deanimate / kick, only against live script users, only from verified players (NO keys) ----
+// Verified players = whitelist.json in the GitHub repo (the same file the script reads): usernames are resolved to userIds through the Roblox users API,
+// userId entries are used as-is; refreshed at start + every 60 s (see refreshWhitelist below). Verified players, owner and co-owner are immune to commands.
+// TRADE-OFF: a userId is public and requests are not signed, so anyone who knows a verified player's userId could send commands as them.
 const crypto = require("crypto");
-let KEYS = []; try { KEYS = JSON.parse(process.env.MOD_KEYS || "[]"); } catch {}
-const fs = require("fs"), CLAIMS_FILE = process.env.MOD_CLAIMS || "mod_claims.json";
-let claims = {}; try { claims = JSON.parse(fs.readFileSync(CLAIMS_FILE, "utf8")); } catch {}
-const authMod = (key, userId) => { // true when `key` is a valid key that is unclaimed (it locks to userId now) or already locked to userId
-  let hit = null; for (const k of KEYS) if (same(key, k)) hit = k;
-  if (!hit) return false;
-  if (!claims[hit]) { claims[hit] = userId; try { fs.writeFileSync(CLAIMS_FILE, JSON.stringify(claims)); } catch {} }
-  return claims[hit] === userId;
-};
-const isMod = (id) => isOwnerId(id) || Object.values(claims).includes(id); // owners are immune too
-const OWNER_KEY = process.env.OWNER_KEY || ""; // owner + co-owner secret (same value as their UhBannerConfig.OwnerKey): accepted by /mod and /verify with no one-time key
+const OWNER_KEY = process.env.OWNER_KEY || ""; // optional owner + co-owner secret (same value as their UhBannerConfig.OwnerKey): still accepted by /mod and /blacklist
 const ownerKeyOk = (key) => OWNER_KEY !== "" && same(key, OWNER_KEY);
 // Owner / co-owner are recognised by userId, so they need NO key (OWNER_KEY still works too). Names are resolved to ids through the Roblox users API
 // at startup + every 10 min; the OWNER_IDS env (JSON array of userIds) adds ids by hand. TRADE-OFF: a userId is public, so anyone can claim it.
 const OWNER_NAMES = ["kingbaconnon19", "hellii129"], ownerIds = new Set();
 try { for (const id of JSON.parse(process.env.OWNER_IDS || "[]")) ownerIds.add(String(id)); } catch {}
 const isOwnerId = (id) => ownerIds.has(String(id));
+const wlIds = new Set(); // userIds of the verified players in whitelist.json
+const isMod = (id) => isOwnerId(id) || wlIds.has(String(id)); // verified players + owners: may send commands, immune to them
 const resolveOwners = async () => { try { const r = await fetch("https://users.roblox.com/v1/usernames/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ usernames: OWNER_NAMES, excludeBannedUsers: false }) }); const j = await r.json(); for (const u of (j && j.data) || []) ownerIds.add(String(u.id)); } catch {} };
 resolveOwners(); setInterval(resolveOwners, 600000).unref();
-const ACTIONS = new Set(["kill", "deanimate", "kick"]), CMD_TTL = 30000, cmds = new Map(), lastCmd = new Map(), lastVerify = new Map();
+const ACTIONS = new Set(["kill", "deanimate", "kick"]), CMD_TTL = 30000, cmds = new Map(), lastCmd = new Map();
 const same = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 setInterval(() => { const now = Date.now(); for (const [r, m] of cmds) { for (const id in m) { m[id] = m[id].filter((c) => c.exp > now); if (!m[id].length) delete m[id]; } if (!Object.keys(m).length) cmds.delete(r); } }, 15000).unref();
 
@@ -39,6 +32,28 @@ setInterval(() => { const now = Date.now(); for (const [r, m] of cmds) { for (co
 const GH_REPO = process.env.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system", GH_BRANCH = process.env.GITHUB_BRANCH || "main", BL_PATH = process.env.BLACKLIST_PATH || "blacklist.json";
 const ghUrl = `https://api.github.com/repos/${GH_REPO}/contents/${BL_PATH}`;
 const ghHeaders = () => ({ Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "uh-mod-visual-system", "X-GitHub-Api-Version": "2022-11-28" });
+// ---- verified players: whitelist.json from the GitHub repo -> wlIds (kept as-is when a refresh fails) ----
+const WL_URL = process.env.WHITELIST_URL || `https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/whitelist.json`, nameIds = new Map();
+const refreshWhitelist = async () => {
+  try {
+    const r = await fetch(`${WL_URL}?t=${Date.now()}`); if (!r.ok) return;
+    const j = await r.json(); if (!j || !Array.isArray(j.entries)) return;
+    const ids = new Set(), names = [];
+    for (const e of j.entries) {
+      if (!e || typeof e !== "object") continue;
+      const id = Math.floor(Number(e.userId) || 0); if (id > 0) ids.add(String(id));
+      const n = typeof e.username === "string" ? e.username.toLowerCase() : ""; if (/^\w{3,20}$/.test(n)) names.push(n);
+    }
+    const need = names.filter((n) => !nameIds.has(n));
+    if (need.length) {
+      const rr = await fetch("https://users.roblox.com/v1/usernames/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ usernames: need, excludeBannedUsers: false }) });
+      const jj = await rr.json(); for (const u of (jj && jj.data) || []) nameIds.set(String(u.requestedUsername || u.name).toLowerCase(), String(u.id));
+    }
+    for (const n of names) if (nameIds.has(n)) ids.add(nameIds.get(n));
+    wlIds.clear(); for (const id of ids) wlIds.add(id);
+  } catch {}
+};
+refreshWhitelist(); setInterval(refreshWhitelist, 60000).unref();
 let blLock = Promise.resolve();
 const locked = (fn) => { const run = blLock.then(fn); blLock = run.catch(() => {}); return run; }; // one edit at a time (GitHub needs the latest sha)
 async function editBlacklist(mutate) { // mutate(entries) -> new entries, or null for "nothing to change"; resolves to the resulting entries
@@ -75,21 +90,6 @@ http.createServer((req, res) => {
       if (p === "/clear") delete m[id];
       else m[id] = { token: tok, exp: now + TTL, userId: +id, name: s(b.name, 40), title: s(b.title, 40), subtitle: s(b.subtitle, 40), image: IMG.test(b.image || "") ? String(b.image) : "", ts: now };
       rooms.set(b.room, m);
-      send(res, 200, { ok: true });
-    });
-    return;
-  }
-  if (req.method === "POST" && p === "/verify") { // key box in the UI: locks a one-time key to this userId (or re-confirms it)
-    let txt = "", dead = false;
-    req.on("data", (c) => { if (dead) return; txt += c; if (txt.length > 1024) { dead = true; send(res, 413, { error: "too large" }); } });
-    req.on("end", () => {
-      if (dead) return;
-      let b; try { b = JSON.parse(txt); } catch { return send(res, 400, { error: "bad json" }); }
-      const id = String(b && b.userId), now = Date.now();
-      if (!ID.test(id) || typeof b.key !== "string") return send(res, 400, { error: "bad" });
-      if (now - (lastVerify.get(id) || 0) < 1000) return send(res, 429, { error: "slow down" });
-      lastVerify.set(id, now);
-      if (!isOwnerId(id) && !ownerKeyOk(b.key) && !authMod(b.key, id)) return send(res, 403, { error: "invalid key or already used" });
       send(res, 200, { ok: true });
     });
     return;
@@ -132,7 +132,7 @@ http.createServer((req, res) => {
       if (!b || !ROOM.test(b.room || "")) return send(res, 400, { error: "bad room" });
       const by = String(b.userId), target = String(b.target), now = Date.now();
       if (!ID.test(by) || !ID.test(target) || !ACTIONS.has(b.action)) return send(res, 400, { error: "bad" });
-      if (!isOwnerId(by) && !ownerKeyOk(b.key || "") && !authMod(b.key || "", by)) return send(res, 403, { error: "not a moderator / key already used by someone else" });
+      if (!isMod(by) && !ownerKeyOk(b.key || "")) return send(res, 403, { error: "not a verified moderator" });
       if (isMod(target)) return send(res, 403, { error: "immune" });
       if (!live(b.room)[target]) return send(res, 404, { error: "target is not running the script" });
       if (now - (lastCmd.get(by) || 0) < 1500) return send(res, 429, { error: "slow down" });
