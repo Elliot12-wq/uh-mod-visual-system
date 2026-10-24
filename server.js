@@ -27,8 +27,8 @@ const ACTIONS = new Set(["kill", "deanimate", "kick"]), CMD_TTL = 30000, cmds = 
 const same = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 setInterval(() => { const now = Date.now(); for (const [r, m] of cmds) { for (const id in m) { m[id] = m[id].filter((c) => c.exp > now); if (!m[id].length) delete m[id]; } if (!Object.keys(m).length) cmds.delete(r); } }, 15000).unref();
 
-// ---- blacklist: blacklist.json lives in the GitHub repo; /blacklist and /unblacklist edit it through the GitHub contents API ----
-// env: GITHUB_TOKEN (fine-grained token, Contents: read + write on the repo), GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json)
+// ---- blacklist: kept ON this backend, so NO GitHub token is needed. List = entries added here + blacklist.json from the repo (read-only, public raw URL), minus entries removed here ----
+// GITHUB_TOKEN is now OPTIONAL: when set, every change is also mirrored into blacklist.json (survives host restarts). env: GITHUB_TOKEN (optional), GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json)
 const GH_REPO = process.env.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system", GH_BRANCH = process.env.GITHUB_BRANCH || "main", BL_PATH = process.env.BLACKLIST_PATH || "blacklist.json";
 const ghUrl = `https://api.github.com/repos/${GH_REPO}/contents/${BL_PATH}`;
 const ghHeaders = () => ({ Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "uh-mod-visual-system", "X-GitHub-Api-Version": "2022-11-28" });
@@ -67,6 +67,17 @@ async function editBlacklist(mutate) { // mutate(entries) -> new entries, or nul
   if (!put.ok) throw new Error("github write " + put.status);
   return next;
 }
+const fs = require("fs"), BL_STORE = process.env.BLACKLIST_STORE || "blacklist_store.json"; // best effort: some free hosts wipe files on restart
+let blStore = { added: [], removed: [] }; try { const j = JSON.parse(fs.readFileSync(BL_STORE, "utf8")); if (Array.isArray(j.added)) blStore.added = j.added; if (Array.isArray(j.removed)) blStore.removed = j.removed.map(String); } catch {}
+let repoBl = []; // blacklist.json from the repo, refreshed every 60 s
+const refreshRepoBl = async () => { try { const r = await fetch(`https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/${BL_PATH}?t=${Date.now()}`); if (!r.ok) return; const j = await r.json(); if (j && Array.isArray(j.entries)) repoBl = j.entries; } catch {} };
+refreshRepoBl(); setInterval(refreshRepoBl, 60000).unref();
+const blList = () => { // effective blacklist
+  const seen = new Set(), out = [];
+  for (const e of [...blStore.added, ...repoBl.filter((x) => !blStore.removed.includes(String(x && x.userId)))]) { const id = String(e && e.userId); if (ID.test(id) && !seen.has(id)) { seen.add(id); out.push(e); } }
+  return out;
+};
+const saveBl = () => { try { fs.writeFileSync(BL_STORE, JSON.stringify(blStore)); } catch {} if (process.env.GITHUB_TOKEN) locked(() => editBlacklist(() => blList())).catch(() => {}); };
 
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://x"), p = url.pathname;
@@ -103,7 +114,8 @@ http.createServer((req, res) => {
     delete m[id];
     return send(res, 200, { commands: out });
   }
-  if (req.method === "POST" && (p === "/blacklist" || p === "/unblacklist")) { // owner / co-owner: add or remove a blacklist.json entry
+  if (req.method === "GET" && p === "/blacklist") return send(res, 200, { entries: blList() }); // scripts read the list here
+  if (req.method === "POST" && (p === "/blacklist" || p === "/unblacklist")) { // owner / co-owner: add or remove an entry
     let txt = "", dead = false;
     req.on("data", (c) => { if (dead) return; txt += c; if (txt.length > 2048) { dead = true; send(res, 413, { error: "too large" }); } });
     req.on("end", () => {
@@ -112,14 +124,18 @@ http.createServer((req, res) => {
       const by = String(b && b.byId), target = String(b && b.userId), now = Date.now();
       if (!ID.test(by) || !ID.test(target)) return send(res, 400, { error: "bad" });
       if (!isOwnerId(by) && !ownerKeyOk(b.key || "")) return send(res, 403, { error: "owner / co-owner only" });
-      if (!process.env.GITHUB_TOKEN) return send(res, 503, { error: "GITHUB_TOKEN is not set on the backend" });
       if (p === "/blacklist" && (isMod(target) || target === by)) return send(res, 403, { error: "immune" });
       if (now - (lastCmd.get("bl" + by) || 0) < 1000) return send(res, 429, { error: "slow down" });
       lastCmd.set("bl" + by, now);
-      const mutate = p === "/blacklist"
-        ? (list) => list.some((e) => String(e.userId) === target) ? null : [...list, { userId: +target, username: s(b.username, 40), by: s(b.by, 40), reason: s(b.reason, 100), ts: now }]
-        : (list) => { const next = list.filter((e) => String(e.userId) !== target); return next.length === list.length ? null : next; };
-      locked(() => editBlacklist(mutate)).then((entries) => send(res, 200, { ok: true, entries }), (e) => send(res, 502, { error: String(e && e.message || e).slice(0, 120) }));
+      const listed = blList().some((e) => String(e.userId) === target);
+      if (p === "/blacklist") {
+        if (!listed) { blStore.removed = blStore.removed.filter((x) => x !== target); blStore.added.push({ userId: +target, username: s(b.username, 40), by: s(b.by, 40), reason: s(b.reason, 100), ts: now }); }
+      } else if (listed) {
+        blStore.added = blStore.added.filter((e) => String(e.userId) !== target);
+        if (!blStore.removed.includes(target)) blStore.removed.push(target);
+      }
+      saveBl();
+      send(res, 200, { ok: true, entries: blList() });
     });
     return;
   }
