@@ -4,6 +4,26 @@ return function(Env, UI)
 	local R = {Banners = {}, Running = false, Kicked = false}
 	local conns, thumbs = {}, {}
 
+	-- Verified users, matched by userId (resolved once from the username; until then the REAL in-game name is used, never the sent payload).
+	-- tag = rank chip text, logo = rotating 3D triangle, color = accent override. An entry of {} = plain verified (check badge only).
+	local VERIFIED = {
+		kingbaconnon19 = {tag = "OWNER", logo = true, color = Color3.fromRGB(255, 190, 50)},
+		hellii129 = {tag = "CO-OWNER", color = Color3.fromRGB(170, 120, 255)},
+	}
+	local roleIds, resolved = {}, {}
+	for name, r in pairs(VERIFIED) do
+		task.spawn(function()
+			local ok, id = pcall(Players.GetUserIdFromNameAsync, Players, name)
+			if ok and id then roleIds[id] = r; resolved[name] = true end
+		end)
+	end
+	local function roleOf(uid)
+		if roleIds[uid] then return roleIds[uid] end
+		local p = Players:GetPlayerByUserId(uid)
+		local n = p and p.Name:lower()
+		if n and VERIFIED[n] and not resolved[n] then return VERIFIED[n] end
+	end
+
 	local function clean(s, n) return (tostring(s or ""):gsub("%c", "")):sub(1, n) end
 	local function headshot(uid)
 		if thumbs[uid] == nil then
@@ -18,9 +38,9 @@ return function(Env, UI)
 		if img == "" then img = headshot(uid) end
 		local name = clean(d.name, 40)
 		local title = clean(d.title, 40)
-		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img}
+		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img, role = roleOf(uid)}
 	end
-	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image end
+	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") end
 
 	local function targetPart(uid)
 		local char
@@ -48,7 +68,9 @@ return function(Env, UI)
 				local o = sanitize(uid, d)
 				local e = R.Banners[uid]
 				if not e then
-					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o)}
+					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role}
+				elseif e.Role ~= o.role then -- rank changed (username just resolved): rebuild
+					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role}
 				elseif e.Sig ~= sig(o) then
 					e.UI:Update(o); e.Sig = sig(o)
 				end
@@ -67,17 +89,49 @@ return function(Env, UI)
 
 	function R.Poke() R.Kicked = true end
 
+	function R.SetHidden(v) -- local-only: hides/shows every banner on this client
+		R.Hidden = v and true or false
+		if not R.Hidden then R.Poke() end
+	end
+
+	function R.Teleport(uid) -- stand 4 studs in front of the player, facing them
+		if os.clock() - (R.LastTP or 0) < 0.6 then return end
+		local p = Players:GetPlayerByUserId(uid)
+		local tr = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		local me = Env.GetLocalCharacter() -- reanimated character when active
+		if not (tr and me and me.Parent) then return end
+		R.LastTP = os.clock()
+		pcall(function()
+			local pos = tr.Position + tr.CFrame.LookVector * 4
+			me:PivotTo(CFrame.lookAt(pos, Vector3.new(tr.Position.X, pos.Y, tr.Position.Z)))
+			local r = me:FindFirstChild("HumanoidRootPart")
+			if r then r.AssemblyLinearVelocity = Vector3.zero end
+		end)
+		local e = R.Banners[uid]
+		if e then e.UI:Update(e.UI.Opts) end -- pulse feedback
+	end
+
 	function R.Start(localOnly)
 		if R.Running then return end
 		if not localOnly and not Env.Request then return warn("[UhBanner] executor has no request(); live sync unavailable") end
 		R.Running = true
 		table.insert(conns, RS.Heartbeat:Connect(function() -- re-anchor every frame: handles respawns / reanim start+stop
 			for uid, e in pairs(R.Banners) do
-				local part = targetPart(uid)
+				local part = not R.Hidden and targetPart(uid) or nil
 				if part ~= e.Part then e.Part = part; e.UI:SetAdornee(part) end
 			end
 		end))
 		table.insert(conns, Players.PlayerRemoving:Connect(function(p) remove(p.UserId) end))
+		if Env.UserInputService and Env.GuiService then -- tap/click another player's banner -> teleport in front of them
+			table.insert(conns, Env.UserInputService.InputBegan:Connect(function(i, gp)
+				local t = i.UserInputType
+				if gp or R.Hidden or (t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch) then return end
+				local pt = Vector2.new(i.Position.X, i.Position.Y) + Env.GuiService:GetGuiInset()
+				for uid, e in pairs(R.Banners) do
+					if uid ~= Env.Player.UserId and e.UI:Contains(pt) then return R.Teleport(uid) end
+				end
+			end))
+		end
 		if localOnly then return end
 		task.spawn(function()
 			local fails = 0

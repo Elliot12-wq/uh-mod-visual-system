@@ -3,16 +3,16 @@
 task.spawn(function()
 	local genv = (getgenv and getgenv()) or _G
 	local Cfg = genv.UhBannerConfig or {}
-	local Base = Cfg.Base or "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/banner/"
-	local Backend = tostring(Cfg.Backend or "https://uh-banner.YOUR-SUBDOMAIN.workers.dev"):gsub("/+$", "")
+	local Base = Cfg.Base or "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/"
+	local Backend = tostring(Cfg.Backend or "https://uh-mod-visual-system.onrender.com"):gsub("/+$", "")
 	local LocalOnly = Backend:find("YOUR%-SUBDOMAIN") ~= nil
-	if LocalOnly then warn("[UhBanner] no backend set: LOCAL-ONLY mode (only you see your banner). Deploy /backend and set getgenv().UhBannerConfig = {Backend = '<worker url>'} for live sync.") end
+	if LocalOnly then warn("[UhBanner] no backend set: LOCAL-ONLY mode (only you see your banner). Deploy worker.js (wrangler deploy) and set getgenv().UhBannerConfig = {Backend = '<worker url>'} for live sync.") end
 	if genv.UhBanner and genv.UhBanner.Stop then pcall(genv.UhBanner.Stop) end -- no duplicates on re-execute
 	local ok, err = pcall(function()
 		local function FXcall(n) local f = Util.FX and Util.FX[n]; if f then return f() end end
 		local Env = {
 			Player = Player, Players = Players, RunService = RunService, HttpService = HttpService,
-			TweenService = cloneref(game:GetService("TweenService")), Request = request, Backend = Backend,
+			TweenService = cloneref(game:GetService("TweenService")), Request = request or http_request or (syn and syn.request), Backend = Backend, UserInputService = UserInputService, GuiService = GuiService,
 			Room = tostring(game.PlaceId) .. "-" .. tostring(game.JobId), Token = HttpService:GenerateGUID(false),
 			GetColor = function() return FXcall("GetColor") end, GetBG = function() return FXcall("GetBG") end,
 			IsLowEnd = function() return FXcall("IsLowEnd") == true end,
@@ -29,6 +29,11 @@ task.spawn(function()
 			elseif Sender.Send(title, image, sub) then Receiver.Poke() end
 		end
 		genv.UhBanner = api
+		-- local-only banner switch (pill button + api.SetEnabled); saved in SaveData.BannerOff; never affects what other users see
+		local function apply(on) if Receiver.SetHidden then Receiver.SetHidden(not on) end; SaveData.BannerOff = (not on) or nil end
+		local setPill = UI.Toggle and UI.Toggle(not SaveData.BannerOff, apply)
+		apply(not SaveData.BannerOff)
+		function api.SetEnabled(on) apply(on); if setPill then setPill(on) end end
 		Receiver.Start(LocalOnly)
 		if not LocalOnly then Sender.Start() end
 		api.Set(Cfg.Title or SaveData.BannerTitle or Player.DisplayName, Cfg.Image or SaveData.BannerImage or "")
