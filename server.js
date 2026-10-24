@@ -21,6 +21,8 @@ const authMod = (key, userId) => { // true when `key` is a valid key that is unc
   return claims[hit] === userId;
 };
 const isMod = (id) => Object.values(claims).includes(id);
+const OWNER_KEY = process.env.OWNER_KEY || ""; // owner + co-owner secret (same value as their UhBannerConfig.OwnerKey): accepted by /mod and /verify with no one-time key
+const ownerKeyOk = (key) => OWNER_KEY !== "" && same(key, OWNER_KEY);
 const ACTIONS = new Set(["kill", "deanimate", "kick"]), CMD_TTL = 30000, cmds = new Map(), lastCmd = new Map(), lastVerify = new Map();
 const same = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 setInterval(() => { const now = Date.now(); for (const [r, m] of cmds) { for (const id in m) { m[id] = m[id].filter((c) => c.exp > now); if (!m[id].length) delete m[id]; } if (!Object.keys(m).length) cmds.delete(r); } }, 15000).unref();
@@ -61,7 +63,7 @@ http.createServer((req, res) => {
       if (!ID.test(id) || typeof b.key !== "string") return send(res, 400, { error: "bad" });
       if (now - (lastVerify.get(id) || 0) < 1000) return send(res, 429, { error: "slow down" });
       lastVerify.set(id, now);
-      if (!authMod(b.key, id)) return send(res, 403, { error: "invalid key or already used" });
+      if (!ownerKeyOk(b.key) && !authMod(b.key, id)) return send(res, 403, { error: "invalid key or already used" });
       send(res, 200, { ok: true });
     });
     return;
@@ -84,7 +86,7 @@ http.createServer((req, res) => {
       if (!b || !ROOM.test(b.room || "")) return send(res, 400, { error: "bad room" });
       const by = String(b.userId), target = String(b.target), now = Date.now();
       if (!ID.test(by) || !ID.test(target) || !ACTIONS.has(b.action)) return send(res, 400, { error: "bad" });
-      if (!authMod(b.key || "", by)) return send(res, 403, { error: "not a moderator / key already used by someone else" });
+      if (!ownerKeyOk(b.key || "") && !authMod(b.key || "", by)) return send(res, 403, { error: "not a moderator / key already used by someone else" });
       if (isMod(target)) return send(res, 403, { error: "immune" });
       if (!live(b.room)[target]) return send(res, 404, { error: "target is not running the script" });
       if (now - (lastCmd.get(by) || 0) < 1500) return send(res, 429, { error: "slow down" });
