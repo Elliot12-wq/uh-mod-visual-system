@@ -1,15 +1,18 @@
 // Cloudflare Worker + Durable Objects: live-sync backend for the Uh mod visual system (banners, verify keys, moderator commands, blacklist, Alt-Fling).
 // One Room Durable Object per Roblox server ("placeId-jobId") holds that server's banners, commands and Alt-Fling state.
 // One extra Room instance named "~meta" (a name no real room can have) holds the global state: one-time key claims, owner ids and blacklist edits.
-// API: GET /banners /commands /alt   POST /banner /clear /mod /alt /verify /blacklist /unblacklist
+// A third instance named "~bc" holds the owner broadcast (announcements every running copy of the script shows in its notification UI).
+// API: GET /banners /commands /alt /poll   POST /banner /clear /mod /alt /verify /blacklist /unblacklist /send
 // Secrets / vars (Workers > Settings > Variables and Secrets, or `wrangler secret put NAME`):
 //   MOD_KEYS (JSON array of one-time keys), OWNER_KEY, OWNER_IDS (JSON array of userIds), GITHUB_TOKEN (Contents: read + write on the repo),
-//   GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json)
+//   GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json),
+//   BROADCAST_KEY (optional: Bearer key for POST /send; falls back to OWNER_KEY)
 const ID = /^\d{1,16}$/, ROOM = /^[0-9A-Za-z:_-]{1,80}$/, IMG = /^(rbxassetid:\/\/)?\d{1,19}$/;
-const TTL = 75000, CMD_TTL = 30000, ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000;
+const TTL = 75000, CMD_TTL = 30000, ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000, BC_COOLDOWN = 2000, BC_KEEP = 50;
 const ACTIONS = new Set(["kill", "deanimate", "kick"]), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
 const OWNER_NAMES = ["kingbaconnon19", "helloman1_23"];
-const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048 };
+const BROADCAST_USER = "Kingbaconnon19"; // the only account name /send accepts (same check the Lua owner panel uses)
+const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048, "/send": 4096 };
 const GET_ROOM = new Set(["/banners", "/commands", "/alt"]);
 const META_PATHS = new Set(["/verify", "/blacklist", "/unblacklist"]);
 const s = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, n);
@@ -29,7 +32,11 @@ export default {
       let b; try { b = JSON.parse(txt); } catch { return j(400, { error: "bad json" }); }
       if (!b || typeof b !== "object") return j(400, { error: "bad json" });
       if (META_PATHS.has(p)) stub = env.ROOM.get(env.ROOM.idFromName("~meta"));
-      else {
+      else if (p === "/send") { // owner broadcast: checked here so a bad caller never wakes the Durable Object
+        const key = env.BROADCAST_KEY || env.OWNER_KEY || "", tok = (req.headers.get("Authorization") || "").replace(/^Bearer /, "");
+        if (key === "" || !same(tok, key) || b.user !== BROADCAST_USER) return j(403, {});
+        stub = env.ROOM.get(env.ROOM.idFromName("~bc"));
+      } else {
         const room = typeof b.room === "string" ? b.room : "";
         if (!ROOM.test(room)) return j(400, { error: "bad room" });
         stub = env.ROOM.get(env.ROOM.idFromName(room));
@@ -39,7 +46,8 @@ export default {
       const room = url.searchParams.get("room");
       if (!ROOM.test(room || "")) return j(400, { error: "bad room" });
       stub = env.ROOM.get(env.ROOM.idFromName(room));
-    } else return j(404, { error: "not found" });
+    } else if (req.method === "GET" && p === "/poll") stub = env.ROOM.get(env.ROOM.idFromName("~bc"));
+    else return j(404, { error: "not found" });
     return stub.fetch("https://do" + p + url.search, init);
   },
 };
@@ -49,9 +57,10 @@ export class Room {
     this.st = state.storage; this.env = env;
     this.dirty = false; this.blLock = Promise.resolve();
     this.lastCmd = new Map(); this.lastAlt = new Map(); this.lastVerify = new Map();
-    this.mods = { ids: new Set(), at: 0 };
+    this.mods = { ids: new Set(), at: 0 }; this.lastBc = 0;
     state.blockConcurrencyWhile(async () => {
-      const g = await this.st.get(["m", "c", "a", "claims", "owners"]);
+      const g = await this.st.get(["m", "c", "a", "claims", "owners", "bc"]);
+      this.bc = g.get("bc") || { last: 0, msgs: [] }; // "~bc" only: owner broadcast, last id + the newest BC_KEEP announcements [{id, text}]
       this.m = g.get("m") || {}; // banners: userId -> {token, exp, ...}
       this.c = g.get("c") || {}; // moderator commands: userId -> [{action, by, ts, exp}]
       this.a = g.get("a") || { pend: {}, rel: {}, ev: {} }; // Alt-Fling: pending requests, relationships, queued events
@@ -63,6 +72,7 @@ export class Room {
   async fetch(req) {
     const p = new URL(req.url).pathname;
     if (META_PATHS.has(p) || p.startsWith("/_/")) return this.meta(req, p);
+    if (p === "/poll" || p === "/send") return this.broadcast(req, p);
     this.sweep();
     try { return await this.route(req, p); } finally { await this.persist(); }
   }
@@ -142,6 +152,23 @@ export class Room {
       catch (err) { return j(502, { error: String((err && err.message) || err).slice(0, 120) }); }
     }
     return j(404, { error: "not found" });
+  }
+
+  // ===== owner broadcast (the "~bc" instance; /send was already authorised by the front Worker) =====
+  async broadcast(req, p) {
+    const bc = this.bc, now = Date.now();
+    if (p === "/poll") { // no `after` = just report the newest id (a fresh client starts from "now" and never replays history)
+      const after = new URL(req.url).searchParams.get("after");
+      return j(200, { id: bc.last, msgs: after === null ? [] : bc.msgs.filter((m) => m.id > Number(after)) });
+    }
+    const b = await req.json();
+    const text = String(b.text || "").replace(/[\u0000-\u001f<>]/g, " ").trim().slice(0, 200);
+    if (!text || now - this.lastBc < BC_COOLDOWN) return j(400, {});
+    this.lastBc = now;
+    bc.last = Math.max(now, bc.last + 1);
+    bc.msgs = [...bc.msgs, { id: bc.last, text }].slice(-BC_KEEP);
+    await this.st.put("bc", bc);
+    return j(200, { id: bc.last });
   }
 
   // ===== room state =====
