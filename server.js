@@ -53,6 +53,19 @@ async function editBlacklist(mutate) { // mutate(entries) -> new entries, or nul
   return next;
 }
 
+// ---- alt-fling: Served User requests, consent, relationships, fling events (identity = the caller's live banner token, same check as /commands) ----
+// pend/rel keys are "flingerId>servedId": the REQUESTER is the Alt Flinger, the TARGET is the Served User. All in memory per room; a relationship needs BOTH players live.
+const ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000, altRooms = new Map(), lastAlt = new Map(), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
+const altRoom = (room) => { let a = altRooms.get(room); if (!a) altRooms.set(room, a = { pend: {}, rel: {}, ev: {} }); return a; };
+const altPush = (a, id, e) => { const now = Date.now(); (a.ev[id] = a.ev[id] || []).push({ ...e, ts: now, exp: now + ALT_EV_TTL }); };
+const altSweep = (room, a) => {
+  const m = live(room), now = Date.now();
+  for (const k in a.pend) if (a.pend[k].exp < now || !m[a.pend[k].from] || !m[a.pend[k].to]) delete a.pend[k];
+  for (const k in a.rel) if (!m[a.rel[k].flinger] || !m[a.rel[k].served]) delete a.rel[k];
+  for (const id in a.ev) { a.ev[id] = a.ev[id].filter((c) => c.exp > now); if (!a.ev[id].length) delete a.ev[id]; }
+};
+setInterval(() => { for (const [r, a] of altRooms) { altSweep(r, a); if (!Object.keys(a.pend).length && !Object.keys(a.rel).length && !Object.keys(a.ev).length) altRooms.delete(r); } }, 15000).unref();
+
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://x"), p = url.pathname;
   if (req.method === "GET" && p === "/") return send(res, 200, { ok: true });
@@ -141,6 +154,76 @@ http.createServer((req, res) => {
       (m[target] = m[target] || []).push({ action: b.action, by: +by, ts: now, exp: now + CMD_TTL });
       cmds.set(b.room, m);
       send(res, 200, { ok: true });
+    });
+    return;
+  }
+  if (req.method === "GET" && p === "/alt") { // my relationships + incoming / outgoing requests (state) and my queued events (drained on read)
+    const room = url.searchParams.get("room"), id = String(url.searchParams.get("userId")), tok = url.searchParams.get("token");
+    if (!ROOM.test(room || "") || !ID.test(id) || !tok) return send(res, 400, { error: "bad" });
+    const m = live(room), mine = m[id];
+    if (!mine || mine.token !== tok) return send(res, 403, { error: "not claimed" });
+    const a = altRooms.get(room) || { pend: {}, rel: {}, ev: {} };
+    altSweep(room, a);
+    const nm = (x) => (m[x] && m[x].name) || "", rels = [], pending = [], out = [];
+    for (const k in a.rel) { const r = a.rel[k]; if (r.flinger === id || r.served === id) rels.push({ flinger: +r.flinger, served: +r.served, fname: nm(r.flinger), sname: nm(r.served), ts: r.ts }); }
+    for (const k in a.pend) { const r = a.pend[k]; if (r.to === id) pending.push({ from: +r.from, name: nm(r.from), ts: r.ts }); else if (r.from === id) out.push({ to: +r.to, name: nm(r.to), ts: r.ts }); }
+    const events = (a.ev[id] || []).map(({ exp, ...pub }) => pub);
+    delete a.ev[id];
+    return send(res, 200, { rels, pending, out, events });
+  }
+  if (req.method === "POST" && p === "/alt") { // op: request | respond | end | fling | result (see AltFling.lua)
+    let txt = "", dead = false;
+    req.on("data", (c) => { if (dead) return; txt += c; if (txt.length > 1024) { dead = true; send(res, 413, { error: "too large" }); } });
+    req.on("end", () => {
+      if (dead) return;
+      let b; try { b = JSON.parse(txt); } catch { return send(res, 400, { error: "bad json" }); }
+      if (!b || !ROOM.test(b.room || "")) return send(res, 400, { error: "bad room" });
+      const me = String(b.userId), tgt = String(b.target), now = Date.now(), m = live(b.room);
+      if (!ID.test(me) || !ID.test(tgt) || typeof b.token !== "string") return send(res, 400, { error: "bad" });
+      if (!m[me] || m[me].token !== b.token) return send(res, 403, { error: "not claimed" });
+      if (me === tgt) return send(res, 400, { error: "self" });
+      if (!m[tgt]) return send(res, 404, { error: "target is not running the script" });
+      if (now - (lastAlt.get(me) || 0) < 400) return send(res, 429, { error: "slow down" });
+      lastAlt.set(me, now);
+      const a = altRoom(b.room), mine = m[me], other = m[tgt], asFlinger = me + ">" + tgt, asServed = tgt + ">" + me;
+      altSweep(b.room, a);
+      if (b.op === "request") { // me = Alt Flinger asking tgt to be my Served User
+        if (a.rel[asFlinger]) return send(res, 409, { error: "already active" });
+        if (a.pend[asFlinger]) return send(res, 409, { error: "already pending" });
+        a.pend[asFlinger] = { from: me, to: tgt, ts: now, exp: now + ALT_REQ_TTL };
+        return send(res, 200, { ok: true });
+      }
+      if (b.op === "respond") { // me = Served User answering tgt's request
+        if (!a.pend[asServed]) return send(res, 404, { error: "no pending request" });
+        delete a.pend[asServed];
+        if (b.accept === true) {
+          a.rel[asServed] = { flinger: tgt, served: me, ts: now };
+          const ev = { type: "accepted", flinger: +tgt, served: +me, fname: other.name, sname: mine.name };
+          altPush(a, tgt, ev); altPush(a, me, ev);
+        } else altPush(a, tgt, { type: "declined", by: +me, name: mine.name });
+        return send(res, 200, { ok: true });
+      }
+      if (b.op === "end") { // either side
+        const k = a.rel[asFlinger] ? asFlinger : a.rel[asServed] ? asServed : null;
+        if (!k) return send(res, 404, { error: "no relationship" });
+        const r = a.rel[k]; delete a.rel[k];
+        altPush(a, tgt, { type: "ended", flinger: +r.flinger, served: +r.served, by: +me, name: mine.name, sname: m[r.served] ? m[r.served].name : "" });
+        return send(res, 200, { ok: true });
+      }
+      if (b.op === "fling") { // me = Served User -> tgt = my Alt Flinger
+        if (!a.rel[asServed]) return send(res, 403, { error: "no active relationship" });
+        const victim = s(b.victim, 40);
+        if (!victim) return send(res, 400, { error: "no victim" });
+        altPush(a, tgt, { type: "fling", cid: s(b.cid, 24), victim, served: +me, sname: mine.name });
+        return send(res, 200, { ok: true });
+      }
+      if (b.op === "result") { // me = Alt Flinger reporting to tgt (Served User); only what the flinger's client actually established
+        if (!a.rel[asFlinger]) return send(res, 403, { error: "no active relationship" });
+        if (!ALT_RESULTS.has(b.result)) return send(res, 400, { error: "bad result" });
+        altPush(a, tgt, { type: "result", cid: s(b.cid, 24), victim: s(b.victim, 40), method: s(b.method, 40), result: b.result, detail: s(b.detail, 80), flinger: +me, fname: mine.name });
+        return send(res, 200, { ok: true });
+      }
+      send(res, 400, { error: "bad op" });
     });
     return;
   }

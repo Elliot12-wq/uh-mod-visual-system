@@ -4,7 +4,7 @@ task.spawn(function()
 	local genv = (getgenv and getgenv()) or _G
 	local Cfg = genv.UhBannerConfig or {}
 	local Base = Cfg.Base or "https://raw.githubusercontent.com/Elliot12-wq/uh-mod-visual-system/main/"
-	local Backend = tostring(Cfg.Backend or "https://uh-mod-visual-system.onrender.com"):gsub("/+$", "")
+	local Backend = tostring(Cfg.Backend or "https://banner-system.elliptmal.workers.dev"):gsub("/+$", "")
 	local LocalOnly = Backend:find("YOUR%-SUBDOMAIN") ~= nil
 	if LocalOnly then warn("[UhBanner] no backend set: LOCAL-ONLY mode (only you see your banner). Deploy worker.js (wrangler deploy) and set getgenv().UhBannerConfig = {Backend = '<worker url>'} for live sync.") end
 	if genv.UhBanner and genv.UhBanner.Stop then pcall(genv.UhBanner.Stop) end -- no duplicates on re-execute

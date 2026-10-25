@@ -1,6 +1,9 @@
-name = "uh-banner"
+name = "banner-system"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+workers_dev = true
+preview_urls = false
+keep_vars = true
 
 [[durable_objects.bindings]]
 name = "ROOM"
