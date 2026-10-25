@@ -16,6 +16,14 @@ const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024
 const GET_ROOM = new Set(["/banners", "/commands", "/alt"]);
 const META_PATHS = new Set(["/verify", "/blacklist", "/unblacklist"]);
 const s = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, n);
+const HEX = /^#[0-9a-fA-F]{6}$/;
+const ni = (v, lo, hi, d) => { v = Math.round(Number(v)); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+const cleanStyle = (x) => { // per-user banner style: validated hex colours + clamped numbers only
+  if (!x || typeof x !== "object") return null;
+  const o = { gr: ni(x.gr, 0, 360, 90), bw: ni(x.bw, 0, 4, 2), bs: ni(x.bs, 0, 2, 2), cr: ni(x.cr, 4, 24, 14), fx: ni(x.fx, 0, 63, 63) };
+  for (const k of ["a", "a2", "b1", "b2"]) if (typeof x[k] === "string" && HEX.test(x[k])) o[k] = x[k].toUpperCase();
+  return o;
+};
 const j = (code, body) => new Response(JSON.stringify(body), { status: code, headers: { "Content-Type": "application/json" } });
 const same = (a, b) => { a = String(a); b = String(b); if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0; };
 const b64e = (str) => { let bin = ""; for (const x of new TextEncoder().encode(str)) bin += String.fromCharCode(x); return btoa(bin); };
@@ -217,7 +225,7 @@ export class Room {
       if (!ID.test(id) || !tok) return j(400, { error: "bad" });
       if (m[id] && m[id].token !== tok) return j(403, { error: "claimed" }); // first claimant owns the id until TTL
       if (p === "/clear") delete m[id];
-      else m[id] = { token: tok, exp: now + TTL, userId: +id, name: s(b.name, 40), title: s(b.title, 40), subtitle: s(b.subtitle, 40), image: IMG.test(b.image || "") ? String(b.image) : "", ts: now };
+      else m[id] = { token: tok, exp: now + TTL, userId: +id, name: s(b.name, 40), title: s(b.title, 40), subtitle: s(b.subtitle, 40), image: IMG.test(b.image || "") ? String(b.image) : "", style: cleanStyle(b.style), ts: now };
       this.dirty = true;
       return j(200, { ok: true });
     }

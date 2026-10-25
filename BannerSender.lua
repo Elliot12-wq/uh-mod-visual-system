@@ -13,10 +13,14 @@ return function(Env)
 	local function copy(t) local c = {}; for k, v in pairs(t) do c[k] = v end; return c end
 
 	function S.Send(title, image, subtitle)
-		S.Payload = {name = Env.Player.Name, title = tostring(title or ""), image = tostring(image or ""), subtitle = tostring(subtitle or ("@" .. Env.Player.Name))}
+		S.Payload = {name = Env.Player.Name, title = tostring(title or ""), image = tostring(image or ""), subtitle = tostring(subtitle or ("@" .. Env.Player.Name)), style = S.Style}
 		local ok, err = post("/banner", copy(S.Payload))
 		if not ok then warn("[UhBanner] send failed: " .. tostring(err)) end
 		return ok, err
+	end
+	function S.SetStyle(st) -- banner style table (or nil = host theme); goes out with the next Send / keep-alive
+		S.Style = st
+		if S.Payload then S.Payload.style = st end
 	end
 	function S.Start() -- backend TTL is 75s; re-announce every 25s
 		if S.Running then return end

@@ -37,6 +37,15 @@ return function(Env, UI)
 
 	R.RoleOf = roleOf
 	local function clean(s, n) return (tostring(s or ""):gsub("%c", "")):sub(1, n) end
+	-- per-user banner style: only well-formed hex colours + clamped numbers ever reach the UI (never raw payload data)
+	local function hex(v) v = tostring(v or ""); return v:match("^#%x%x%x%x%x%x$") and v:upper() or nil end
+	local function num(v, lo, hi, d) v = tonumber(v); if not v then return d end; return math.clamp(math.floor(v + 0.5), lo, hi) end
+	local function cleanStyle(s)
+		if type(s) ~= "table" then return nil end
+		local st = {a = hex(s.a), a2 = hex(s.a2), b1 = hex(s.b1), b2 = hex(s.b2), gr = num(s.gr, 0, 360, 90), bw = num(s.bw, 0, 4, 2), bs = num(s.bs, 0, 2, 2), cr = num(s.cr, 4, 24, 14), fx = num(s.fx, 0, 63, 63)}
+		st.key = table.concat({st.a or "", st.a2 or "", st.b1 or "", st.b2 or "", st.gr, st.bw, st.bs, st.cr, st.fx}, ",")
+		return st
+	end
 	local function headshot(uid)
 		if thumbs[uid] == nil then
 			local ok, url = pcall(Players.GetUserThumbnailAsync, Players, uid, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
@@ -73,7 +82,7 @@ return function(Env, UI)
 		local keys = {}
 		for _, a in ipairs(acts or {}) do keys[#keys + 1] = a.key end
 		return {userId = uid, title = title ~= "" and title or name, subtitle = clean(d.subtitle, 40), image = img, role = roleOf(uid),
-			acts = acts, actKey = table.concat(keys, ",")}
+			acts = acts, actKey = table.concat(keys, ","), style = cleanStyle(d.style)}
 	end
 	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") .. "|" .. o.actKey end
 
@@ -102,14 +111,16 @@ return function(Env, UI)
 				seen[uid] = true
 				confirmed[uid] = d.verified == true
 				local o = sanitize(uid, d)
+				local sk = o.style and o.style.key or ""
 				local e = R.Banners[uid]
 				if not e then
-					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, ActKey = o.actKey}
+					R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), SKey = sk, Role = o.role, ActKey = o.actKey}
 				elseif e.Role ~= o.role or e.ActKey ~= o.actKey then -- rank / moderation rights changed (username just resolved, key redeemed): rebuild
 					R.DisarmKick()
-					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), Role = o.role, ActKey = o.actKey}
-				elseif e.Sig ~= sig(o) then
-					e.UI:Update(o); e.Sig = sig(o)
+					e.UI:Destroy(false); R.Banners[uid] = {UI = UI.new(o), Sig = sig(o), SKey = sk, Role = o.role, ActKey = o.actKey}
+				else
+					if e.Sig ~= sig(o) then e.UI:Update(o); e.Sig = sig(o) end
+					if e.SKey ~= sk and not (uid == Env.Player.UserId and os.clock() < (R.StyleHold or 0)) then e.UI:Restyle(o.style); e.SKey = sk end
 				end
 			end
 		end
@@ -125,6 +136,13 @@ return function(Env, UI)
 	end
 
 	function R.Poke() R.Kicked = true end
+
+	function R.ApplyLocalStyle(raw) -- instant preview of YOUR style on your own banner (the backend poll then confirms it for everyone)
+		local st = cleanStyle(raw)
+		R.StyleHold = os.clock() + 3
+		local e = R.Banners[Env.Player.UserId]
+		if e then e.UI:Restyle(st); e.SKey = st and st.key or "" end
+	end
 
 	function R.SetHidden(v) -- local-only: hides/shows every banner on this client
 		R.Hidden = v and true or false
