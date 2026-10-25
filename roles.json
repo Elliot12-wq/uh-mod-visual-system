@@ -1,0 +1,7 @@
+{
+  "_readme": "Owner / co-owner list read by the uh-mod script (replaces the names that used to be hardcoded). role = owner or co-owner. Use username and/or userId per entry. Edits apply within ~60s, no rejoin needed.",
+  "entries": [
+    { "username": "Kingbaconnon19", "role": "owner" },
+    { "username": "helloman1_23", "role": "co-owner" }
+  ]
+}
