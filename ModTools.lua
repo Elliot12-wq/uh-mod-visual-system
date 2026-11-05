@@ -40,6 +40,33 @@ return function(Env, R)
 		return true
 	end
 
+	-- consent-based visual actions (Bring Users / Hallucinate Users / Dizzy): ONE gate for owner, co-owner and verified players (role detection = BannerReceiver.RoleOf).
+	-- The backend's /fx authorises the sender again and holds the request until the recipient accepts (ModFx). Owner / co-owner / verified are never targets (same immunity as Send).
+	M.FxActions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}}
+	local FX = {bring = true, hallucinate = true, dizzy = true}
+
+	function M.CanFx()
+		return Env.Request ~= nil and R.RoleOf(Env.Player.UserId) ~= nil
+	end
+
+	function M.FxRequest(target, action, avatars)
+		if not FX[action] then return false, "bad action" end
+		if not M.CanFx() then return false, "verified players, owner and co-owner only" end
+		target = tonumber(target)
+		if not target or target == Env.Player.UserId then return false, "bad target" end
+		if R.IsWhitelisted(target) then return false, "verified players are immune" end
+		local body = {room = Env.Room, userId = Env.Player.UserId, token = Env.Token, key = Env.ModKey, op = "request", target = tostring(target), action = action, avatars = avatars}
+		if Env.Sign then body = Env.Sign("/fx", body, tostring(target) .. ":" .. action) end
+		local ok, res = pcall(Env.Request, {Url = Env.Backend .. "/fx", Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = HS:JSONEncode(body)})
+		if not ok then return false, tostring(res) end
+		if type(res) ~= "table" then return false, "no response" end
+		if res.StatusCode ~= 200 then
+			local okD, d = pcall(HS.JSONDecode, HS, res.Body or "")
+			return false, (okD and type(d) == "table" and d.error) or ("HTTP " .. tostring(res.StatusCode))
+		end
+		return true
+	end
+
 	local function toast(msg)
 		pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", {Title = "Moderator", Text = msg, Duration = 6}) end)
 	end
