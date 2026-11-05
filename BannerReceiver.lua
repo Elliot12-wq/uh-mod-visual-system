@@ -186,7 +186,7 @@ return function(Env, UI)
 		R.CloseMenu()
 		local items = {{"Teleport", Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end}}
 		if mod then -- moderators: kick / kill / deanimate only (relayed to script users, never to verified players)
-			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}}) do
+			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}, {"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}}) do
 				table.insert(items, {a[1], Color3.fromRGB(205, 125, 40), function()
 					task.spawn(function()
 						local ok, err = Env.Mod.Send(uid, a[2])
