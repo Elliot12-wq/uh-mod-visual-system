@@ -2,21 +2,20 @@
 // One Room Durable Object per Roblox server ("placeId-jobId") holds that server's banners, commands and Alt-Fling state.
 // One extra Room instance named "~meta" (a name no real room can have) holds the global state: one-time key claims, owner ids and blacklist edits.
 // A third instance named "~bc" holds the owner broadcast (announcements every running copy of the script shows in its notification UI).
-// API: GET /banners /commands /alt /fx /poll   POST /banner /clear /mod /alt /fx /verify /blacklist /unblacklist /send
+// API: GET /banners /commands /alt /poll   POST /banner /clear /mod /alt /verify /blacklist /unblacklist /send
 // Secrets / vars (Workers > Settings > Variables and Secrets, or `wrangler secret put NAME`):
 //   MOD_KEYS (JSON array of one-time keys), OWNER_KEY, OWNER_IDS (JSON array of userIds), GITHUB_TOKEN (Contents: read + write on the repo),
 //   GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json),
 //   BROADCAST_KEY (optional: Bearer key for POST /send; falls back to OWNER_KEY)
 const ID = /^\d{1,16}$/, ROOM = /^[0-9A-Za-z:_-]{1,80}$/, IMG = /^(rbxassetid:\/\/)?\d{1,19}$/;
 const TTL = 75000, CMD_TTL = 30000, ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000, BC_COOLDOWN = 2000, BC_KEEP = 50;
-const ACTIONS = new Set(["kill", "deanimate", "kick"]), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
-// Effects (Bring Users / Hallucinate Users / Dizzy): consent-based, visual only. durations (ms), per sender>target>action cooldown, request lifetime, cooldown after a decline, max pending per recipient, max avatars.
-const FX_ACTIONS = new Set(["bring", "hallucinate", "dizzy"]), FX_DUR = { bring: 120000, hallucinate: 60000, dizzy: 20000 }, FX_CD = { bring: 30000, hallucinate: 90000, dizzy: 45000 };
-const FX_REQ_TTL = 60000, FX_DECLINE_CD = 60000, FX_MAX_PEND = 3, FX_AVATARS = 4;
+// Effects (Bring Users / Hallucinate Users / Dizzy) use the same /mod path as kill / deanimate / kick: no recipient consent step and no cooldown. The recipient's client runs them and cleans them up (hallucinate 60 s, dizzy 20 s).
+const FX_ACTIONS = new Set(["bring", "hallucinate", "dizzy"]), FX_QUEUE_MAX = 25; // FX_QUEUE_MAX = storage guard on one target's command queue (drained every few seconds), not a cooldown
+const ACTIONS = new Set(["kill", "deanimate", "kick", ...FX_ACTIONS]), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
 const OWNER_NAMES = ["kingbaconnon19", "helloman1_23"];
 const BROADCAST_USER = "Kingbaconnon19"; // the only account name /send accepts (same check the Lua owner panel uses)
-const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/fx": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048, "/send": 4096 };
-const GET_ROOM = new Set(["/banners", "/commands", "/alt", "/fx"]);
+const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048, "/send": 4096 };
+const GET_ROOM = new Set(["/banners", "/commands", "/alt"]);
 const META_PATHS = new Set(["/verify", "/blacklist", "/unblacklist"]);
 const s = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, n);
 const HEX = /^#[0-9a-fA-F]{6}$/;
@@ -67,14 +66,14 @@ export class Room {
   constructor(state, env) {
     this.st = state.storage; this.env = env;
     this.dirty = false; this.blLock = Promise.resolve();
-    this.lastCmd = new Map(); this.lastAlt = new Map(); this.lastVerify = new Map(); this.lastFx = new Map(); this.fxCd = new Map();
+    this.lastCmd = new Map(); this.lastAlt = new Map(); this.lastVerify = new Map(); this.nameIds = new Map(); this.rost = null;
     this.mods = { ids: new Set(), at: 0 }; this.lastBc = 0;
     state.blockConcurrencyWhile(async () => {
       const g = await this.st.get(["m", "c", "a", "claims", "owners", "bc"]);
       this.bc = g.get("bc") || { last: 0, msgs: [] }; // "~bc" only: owner broadcast, last id + the newest BC_KEEP announcements [{id, text}]
       this.m = g.get("m") || {}; // banners: userId -> {token, exp, ...}
       this.c = g.get("c") || {}; // moderator commands: userId -> [{action, by, ts, exp}]
-      this.a = g.get("a") || { pend: {}, rel: {}, ev: {} }; this.a.fx = this.a.fx || { pend: {}, act: {}, ev: {} }; // fx: Effects requests / running effects / queued events // Alt-Fling: pending requests, relationships, queued events
+      this.a = g.get("a") || { pend: {}, rel: {}, ev: {} }; delete this.a.fx; // (old consent-based effects state is dropped) // Alt-Fling: pending requests, relationships, queued events
       this.claims = g.get("claims") || {}; // meta only: one-time key -> userId it locked to
       this.own = g.get("owners") || { ids: [], at: 0 }; // meta only: resolved owner ids
     });
@@ -106,7 +105,40 @@ export class Room {
     try { for (const id of JSON.parse(this.env.OWNER_IDS || "[]")) set.add(String(id)); } catch {}
     return set;
   }
-  async modIds() { return new Set([...Object.values(this.claims).map(String), ...(await this.owners())]); }
+  async roster() { // owner / co-owner (roles.json) + verified players (whitelist.json) from the GitHub repo, resolved to userIds; cached 60 s
+    const now = Date.now(), e = this.env;
+    if (this.rost && now - this.rost.at < 60000) return this.rost.ids;
+    const prev = this.rost ? this.rost.ids : new Set();
+    this.rost = { ids: prev, at: now - 45000 }; // on failure keep the last good list, retry in ~15 s
+    try {
+      const base = `https://raw.githubusercontent.com/${e.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system"}/${e.GITHUB_BRANCH || "main"}/`;
+      const ids = new Set(), names = new Set();
+      for (const f of ["roles.json", "whitelist.json"]) {
+        const r = await fetch(base + f + "?t=" + now, { cf: { cacheTtl: 0 } });
+        if (!r.ok) throw new Error(f + " " + r.status);
+        const d = await r.json();
+        for (const x of Array.isArray(d && d.entries) ? d.entries : []) {
+          if (!x || typeof x !== "object") continue;
+          if (f === "roles.json" && !["owner", "co-owner"].includes(String(x.role || "").toLowerCase())) continue;
+          const id = Math.floor(Number(x.userId)) || 0, n = typeof x.username === "string" ? x.username.toLowerCase() : "";
+          if (id > 0) ids.add(String(id));
+          if (/^[0-9a-z_]{3,20}$/.test(n)) names.add(n);
+        }
+      }
+      const todo = [...names].filter((n) => !this.nameIds.has(n)).slice(0, 100);
+      if (todo.length) {
+        try {
+          const r = await fetch("https://users.roblox.com/v1/usernames/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ usernames: todo, excludeBannedUsers: false }) });
+          const d = await r.json();
+          for (const u of (d && d.data) || []) this.nameIds.set(String(u.requestedUsername || u.name).toLowerCase(), String(u.id));
+        } catch {}
+      }
+      for (const n of names) if (this.nameIds.has(n)) ids.add(this.nameIds.get(n));
+      this.rost = { ids, at: now };
+    } catch {}
+    return this.rost.ids;
+  }
+  async modIds() { return new Set([...Object.values(this.claims).map(String), ...(await this.owners()), ...(await this.roster())]); }
   async ownerOk(id, key) { const k = this.env.OWNER_KEY || ""; return (await this.owners()).has(String(id)) || (k !== "" && same(key || "", k)); }
   async authModKey(key, userId) { // true when `key` is a valid one-time key that is unclaimed (it locks to userId now) or already locked to userId
     let keys = []; try { keys = JSON.parse(this.env.MOD_KEYS || "[]"); } catch {}
@@ -116,7 +148,7 @@ export class Room {
     if (!this.claims[hit]) { this.claims[hit] = userId; await this.st.put("claims", this.claims); }
     return this.claims[hit] === userId;
   }
-  async modAuth(id, key) { return (await this.ownerOk(id, key)) || (await this.authModKey(key, String(id))); }
+  async modAuth(id, key) { return (await this.ownerOk(id, key)) || (await this.roster()).has(String(id)) || (await this.authModKey(key, String(id))); }
   locked(fn) { const run = this.blLock.then(fn); this.blLock = run.catch(() => {}); return run; } // one blacklist edit at a time (GitHub needs the latest sha)
   async editBlacklist(mutate) { // mutate(entries) -> new entries, or null for "nothing to change"; resolves to the resulting entries
     const e = this.env, repo = e.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system", branch = e.GITHUB_BRANCH || "main", path = e.BLACKLIST_PATH || "blacklist.json";
@@ -203,26 +235,15 @@ export class Room {
     for (const k in a.pend) if (a.pend[k].exp < now || !this.m[a.pend[k].from] || !this.m[a.pend[k].to]) { delete a.pend[k]; ch = true; }
     for (const k in a.rel) if (!this.m[a.rel[k].flinger] || !this.m[a.rel[k].served]) { delete a.rel[k]; ch = true; } // a relationship needs BOTH players live
     for (const id in a.ev) { const f = a.ev[id].filter((x) => x.exp > now); if (f.length !== a.ev[id].length) ch = true; if (f.length) a.ev[id] = f; else delete a.ev[id]; }
-    const f = a.fx; // Effects: expire requests (the sender is told), running-effect records and queued events
-    for (const k in f.pend) {
-      const r = f.pend[k];
-      if (r.exp < now || !this.m[r.from] || !this.m[r.to]) {
-        if (r.exp < now && this.m[r.from]) this.fxPush(r.from, { type: "expired", action: r.action, by: +r.to, name: (this.m[r.to] && this.m[r.to].name) || "" });
-        delete f.pend[k]; ch = true;
-      }
-    }
-    for (const k in f.act) if (f.act[k].exp < now) { delete f.act[k]; ch = true; }
-    for (const id in f.ev) { const x = f.ev[id].filter((e) => e.exp > now); if (x.length !== f.ev[id].length) ch = true; if (x.length) f.ev[id] = x; else delete f.ev[id]; }
     if (ch) this.dirty = true;
   }
   async persist() {
     if (!this.dirty) return;
     this.dirty = false;
     const a = this.a;
-    if (!Object.keys(this.m).length && !Object.keys(this.c).length && !Object.keys(a.pend).length && !Object.keys(a.rel).length && !Object.keys(a.ev).length && !Object.keys(a.fx.pend).length && !Object.keys(a.fx.act).length && !Object.keys(a.fx.ev).length) await this.st.deleteAll();
+    if (!Object.keys(this.m).length && !Object.keys(this.c).length && !Object.keys(a.pend).length && !Object.keys(a.rel).length && !Object.keys(a.ev).length) await this.st.deleteAll();
     else { await this.st.put({ m: this.m, c: this.c, a }); await this.st.setAlarm(Date.now() + 300000); }
   }
-  fxPush(id, e) { const now = Date.now(); (this.a.fx.ev[id] = this.a.fx.ev[id] || []).push({ ...e, ts: now, exp: now + ALT_EV_TTL }); this.dirty = true; }
   altPush(id, e) { const now = Date.now(); (this.a.ev[id] = this.a.ev[id] || []).push({ ...e, ts: now, exp: now + ALT_EV_TTL }); this.dirty = true; }
 
   async route(req, p) {
@@ -253,14 +274,14 @@ export class Room {
       return j(200, { commands: out });
     }
 
-    if (req.method === "POST" && p === "/mod") { // kill / deanimate / kick, only against live script users, only from moderators
-      const b = await req.json(), by = String(b.userId), target = String(b.target);
+    if (req.method === "POST" && p === "/mod") { // kill / deanimate / kick + bring / hallucinate / dizzy, only against live script users, only from owner / co-owner / verified players
+      const b = await req.json(), by = String(b.userId), target = String(b.target), fx = FX_ACTIONS.has(b.action);
       if (!ID.test(by) || !ID.test(target) || !ACTIONS.has(b.action)) return j(400, { error: "bad" });
+      if (fx && (by === target || !m[by] || typeof b.token !== "string" || m[by].token !== b.token)) return j(403, { error: "not claimed" }); // effects need proof of the sender's own live banner (same check as /commands), never just a claimed id
       if (!(await this.metaAuth(by, b.key))) return j(403, { error: "not a moderator / key already used by someone else" });
       if ((await this.modSet(true)).has(target)) return j(403, { error: "immune" });
       if (!m[target]) return j(404, { error: "target is not running the script" });
-      if (now - (this.lastCmd.get(by) || 0) < 1500) return j(429, { error: "slow down" });
-      this.lastCmd.set(by, now);
+      if (fx) { if ((this.c[target] || []).length >= FX_QUEUE_MAX) return j(429, { error: "target queue full" }); } // effects: no cooldown
       (this.c[target] = this.c[target] || []).push({ action: b.action, by: +by, ts: now, exp: now + CMD_TTL });
       this.dirty = true;
       return j(200, { ok: true });
@@ -325,85 +346,6 @@ export class Room {
         if (!a.rel[asFlinger]) return j(403, { error: "no active relationship" });
         if (!ALT_RESULTS.has(b.result)) return j(400, { error: "bad result" });
         this.altPush(tgt, { type: "result", cid: s(b.cid, 24), victim: s(b.victim, 40), method: s(b.method, 40), result: b.result, detail: s(b.detail, 80), flinger: +me, fname: mine.name });
-        return j(200, { ok: true });
-      }
-      return j(400, { error: "bad op" });
-    }
-
-
-    // ---- Effects: Bring Users / Hallucinate Users / Dizzy (see ModFx.lua). pend keys "senderId>recipientId", act keys "recipientId:action". Nothing starts without the recipient's explicit accept. ----
-    if (req.method === "GET" && p === "/fx") { // my incoming / outgoing requests (state) and my queued events (drained on read)
-      const id = String(url.searchParams.get("userId")), tok = url.searchParams.get("token");
-      if (!ID.test(id) || !tok) return j(400, { error: "bad" });
-      if (!m[id] || m[id].token !== tok) return j(403, { error: "not claimed" });
-      const f = a.fx, nm = (x) => (m[x] && m[x].name) || "", pending = [], out = [];
-      for (const k in f.pend) {
-        const r = f.pend[k];
-        if (r.to === id) pending.push({ from: +r.from, name: nm(r.from), action: r.action, ts: r.ts, avatars: r.avatars.map((x) => ({ userId: +x, name: nm(x) })) });
-        else if (r.from === id) out.push({ to: +r.to, name: nm(r.to), action: r.action, ts: r.ts });
-      }
-      const events = (f.ev[id] || []).map(({ exp, ...pub }) => pub);
-      if (f.ev[id]) { delete f.ev[id]; this.dirty = true; }
-      return j(200, { pending, out, events });
-    }
-    if (req.method === "POST" && p === "/fx") { // op: request | respond | withdraw | cancel
-      const b = await req.json(), me = String(b.userId), tgt = String(b.target), f = a.fx;
-      if (!ID.test(me) || !ID.test(tgt) || typeof b.token !== "string") return j(400, { error: "bad" });
-      if (!m[me] || m[me].token !== b.token) return j(403, { error: "not claimed" });
-      if (me === tgt) return j(400, { error: "self" });
-      if (!m[tgt]) return j(404, { error: "target is not running the script" });
-      if (now - (this.lastFx.get(me) || 0) < 500) return j(429, { error: "slow down" });
-      this.lastFx.set(me, now);
-      const mine = m[me], other = m[tgt], out = me + ">" + tgt, inc = tgt + ">" + me;
-      if (b.op === "request") { // me = sender: owner / co-owner / verified, decided HERE (owner id / owner key / claimed moderator key), never from a client claim
-        const act = String(b.action);
-        if (!FX_ACTIONS.has(act)) return j(400, { error: "bad action" });
-        if (!(await this.metaAuth(me, b.key))) return j(403, { error: "verified players, owner and co-owner only" });
-        const mods = await this.modSet(true);
-        if (mods.has(tgt)) return j(403, { error: "immune" });
-        if (f.pend[out]) return j(409, { error: "already pending" });
-        if (f.act[tgt + ":" + act]) return j(409, { error: "already active on that player" });
-        const wait = (this.fxCd.get(out + ":" + act) || 0) - now;
-        if (wait > 0) return j(429, { error: "cooldown " + Math.ceil(wait / 1000) + "s" });
-        let inbox = 0; for (const k in f.pend) if (f.pend[k].to === tgt) inbox++;
-        if (inbox >= FX_MAX_PEND) return j(429, { error: "that player already has pending requests" });
-        let av = [];
-        if (act === "hallucinate") { // avatars must be live script users, never the recipient, never immune players (except the sender picking themselves)
-          av = [...new Set((Array.isArray(b.avatars) ? b.avatars : []).map((x) => String(x)))].filter((x) => ID.test(x) && x !== tgt && m[x] && (x === me || !mods.has(x))).slice(0, FX_AVATARS);
-          if (!av.length) return j(400, { error: "no active script-user avatars to show" });
-        }
-        f.pend[out] = { from: me, to: tgt, action: act, ts: now, exp: now + FX_REQ_TTL, avatars: av };
-        this.fxCd.set(out + ":" + act, now + FX_CD[act]);
-        this.dirty = true;
-        return j(200, { ok: true });
-      }
-      if (b.op === "respond") { // me = recipient answering tgt's request; the effect payload comes back from here, not from the sender
-        const r = f.pend[inc];
-        if (!r) return j(404, { error: "no pending request" });
-        delete f.pend[inc]; this.dirty = true;
-        if (b.accept !== true || f.act[me + ":" + r.action]) {
-          this.fxCd.set(inc + ":" + r.action, now + FX_DECLINE_CD);
-          this.fxPush(tgt, { type: "declined", action: r.action, by: +me, name: mine.name });
-          return b.accept === true ? j(409, { error: "that effect is already running" }) : j(200, { ok: true });
-        }
-        f.act[me + ":" + r.action] = { from: tgt, to: me, action: r.action, ts: now, exp: now + FX_DUR[r.action] + 5000 };
-        this.fxPush(tgt, { type: "accepted", action: r.action, by: +me, name: mine.name });
-        return j(200, { ok: true, start: { action: r.action, from: +tgt, name: other.name, dur: FX_DUR[r.action] / 1000, avatars: r.avatars.map((x) => ({ userId: +x, name: (m[x] && m[x].name) || "" })) } });
-      }
-      if (b.op === "withdraw") { // me = sender taking back a request that has not been answered yet
-        const r = f.pend[out];
-        if (!r) return j(404, { error: "no pending request" });
-        delete f.pend[out];
-        this.fxPush(tgt, { type: "withdrawn", action: r.action, by: +me, name: mine.name });
-        this.dirty = true;
-        return j(200, { ok: true });
-      }
-      if (b.op === "cancel") { // me = recipient ending a running effect early (cancel button, arrived, respawn); tgt = the sender, who is told
-        const act = String(b.action), key = me + ":" + act;
-        if (!FX_ACTIONS.has(act) || !f.act[key] || f.act[key].from !== tgt) return j(404, { error: "nothing to cancel" });
-        delete f.act[key];
-        this.fxPush(tgt, { type: "cancelled", action: act, by: +me, name: mine.name, why: s(b.why, 12) });
-        this.dirty = true;
         return j(200, { ok: true });
       }
       return j(400, { error: "bad op" });
