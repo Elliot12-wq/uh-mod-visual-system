@@ -57,25 +57,8 @@ return function(Env, R)
 	end
 
 	-- ===== Bring Users =====
-	-- fallback when no safe spot exists: a marker over the moderator for 30 s
-	local function meet(sp)
-		stopFx("meet")
-		local head = sp.Character and sp.Character:FindFirstChild("Head")
-		local pg = Env.Player:FindFirstChildOfClass("PlayerGui")
-		if not (head and pg) then return toast("No safe spot - meet " .. sp.Name) end
-		local g = Instance.new("BillboardGui")
-		g.Name, g.Adornee, g.AlwaysOnTop, g.Size, g.StudsOffset, g.MaxDistance = "UhMeet", head, true, UDim2.fromOffset(170, 30), Vector3.new(0, 3.5, 0), math.huge
-		g.Parent = pg
-		local l = Instance.new("TextLabel", g)
-		l.Size, l.BackgroundColor3, l.BackgroundTransparency, l.Text = UDim2.fromScale(1, 1), Color3.fromRGB(24, 24, 30), 0.25, "Meet " .. sp.Name
-		l.TextColor3, l.Font, l.TextSize = Color3.new(1, 1, 1), Enum.Font.GothamBold, 14
-		Instance.new("UICorner", l).CornerRadius = UDim.new(0, 8)
-		local function stop() g:Destroy() end
-		fx.meet = stop
-		expire("meet", stop, 30)
-		toast("No safe spot next to " .. sp.Name .. " - meet them (marker shown)")
-	end
-
+	-- THIS client teleports to stand 4 studs in front of the moderator, facing them (same move as the banner "Teleport", reversed). A clear spot (no wall between, solid
+	-- flat floor at the moderator's level, no hazard under it) is preferred; when none is found the spot straight in front of the moderator is used anyway, so it always happens.
 	local BAD = {"kill", "lava", "death", "damage", "acid", "spike", "hurt", "void", "trap", "laser"}
 	local function dangerous(hit)
 		local inst = hit.Instance
@@ -88,7 +71,11 @@ return function(Env, R)
 		return false
 	end
 
-	-- a spot in front of the moderator: clear line of sight (no wall between), flat solid floor at the moderator's level, no hazard under it, room for a character
+	local function flatLook(sr)
+		local v = Vector3.new(sr.CFrame.LookVector.X, 0, sr.CFrame.LookVector.Z)
+		return v.Magnitude > 0.01 and v.Unit or Vector3.new(0, 0, -1)
+	end
+
 	local function findSpot(sch, sr, me, lift)
 		local rp = RaycastParams.new()
 		rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
@@ -96,11 +83,9 @@ return function(Env, R)
 		local op = OverlapParams.new()
 		op.FilterType = Enum.RaycastFilterType.Exclude
 		op.FilterDescendantsInstances = {sch, me}
-		local base = sr.Position
-		local look = Vector3.new(sr.CFrame.LookVector.X, 0, sr.CFrame.LookVector.Z)
-		look = look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1)
+		local base, look = sr.Position, flatLook(sr)
 		local floorY, voidY = base.Y - lift, workspace.FallenPartsDestroyHeight
-		for _, dist in ipairs({5, 4, 7}) do
+		for _, dist in ipairs({4, 5, 7}) do
 			for _, ang in ipairs({0, 40, -40, 80, -80}) do
 				local at = base + (CFrame.Angles(0, math.rad(ang), 0) * look) * dist
 				if not workspace:Raycast(base, at - base, rp) then
@@ -108,7 +93,10 @@ return function(Env, R)
 					if g and g.Normal.Y > 0.75 and math.abs(g.Position.Y - floorY) <= 5 and g.Position.Y > voidY + 20 and not dangerous(g) then
 						local free = true
 						for _, p in ipairs(workspace:GetPartBoundsInBox(CFrame.new(g.Position + Vector3.new(0, 3.3, 0)), Vector3.new(2.6, 5.6, 2.6), op)) do
-							if p.CanCollide then free = false break end
+							if p.CanCollide then
+								free = false
+								break
+							end
 						end
 						if free then
 							local pos = g.Position + Vector3.new(0, lift, 0)
@@ -124,112 +112,182 @@ return function(Env, R)
 		local sch = sp.Character
 		local sr = sch and sch:FindFirstChild("HumanoidRootPart")
 		local me = myChar()
-		local root = me and me:FindFirstChild("HumanoidRootPart")
-		local hum = me and me:FindFirstChildOfClass("Humanoid")
+		if not (sr and me and me.Parent) then return toast("Bring failed: " .. sp.Name .. " is not loaded for you") end
+		local root = me:FindFirstChild("HumanoidRootPart")
+		local hum = me:FindFirstChildOfClass("Humanoid")
 		local cf
-		if sr and root and hum and me.Parent then
-			local ok, r = pcall(findSpot, sch, sr, me, math.max(hum.HipHeight + root.Size.Y / 2, 3))
-			cf = ok and r or nil
-		end
-		if not cf then return meet(sp) end
 		pcall(function()
-			if hum.SeatPart then hum.Sit = false end
+			local lift = math.max(((hum and hum.HipHeight) or 2) + ((root and root.Size.Y) or 2) / 2, 3)
+			cf = findSpot(sch, sr, me, lift)
+		end)
+		if not cf then -- no clear spot: straight in front of the moderator, stopping short of a wall
+			local look, dist = flatLook(sr), 4
+			pcall(function()
+				local rp = RaycastParams.new()
+				rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+				rp.FilterDescendantsInstances = {sch, me}
+				local h = workspace:Raycast(sr.Position, look * 4, rp)
+				if h then dist = math.max(1, h.Distance - 1.5) end
+			end)
+			local pos = sr.Position + look * dist
+			cf = CFrame.lookAt(pos, Vector3.new(sr.Position.X, pos.Y, sr.Position.Z))
+		end
+		pcall(function()
+			if hum and hum.SeatPart then hum.Sit = false end
 			me:PivotTo(cf)
-			root.AssemblyLinearVelocity = Vector3.zero
+			if root then root.AssemblyLinearVelocity = Vector3.zero end
 		end)
 	end
 
 	-- ===== Hallucinate Users =====
-	-- a local-only, anchored, non-colliding copy of the sender's character creeps toward YOU for 60 s, then fades and is destroyed. It lives under the camera
-	-- (invisible to the game's own workspace scans), nothing is replicated and no real character is touched.
-	local function hallucinate(sp)
+	-- a local-only copy of YOUR OWN avatar appears in the distance and creeps toward you for 60 s: a tiny step or two, a stop, then a few more, always facing you.
+	-- Root anchored, every part non-colliding / untouchable / unqueryable, no Humanoid (games can't mistake it for a player), parked under the camera; destroyed when
+	-- the 60 s are up. Nothing is replicated and your real character is never touched.
+	local RIG = {R15 = {walk = "rbxassetid://507777826", idle = "rbxassetid://507766388"}, R6 = {walk = "rbxassetid://180426354", idle = "rbxassetid://180435571"}}
+	local function animId(g, folderName, animName, default) -- the avatar's own animation pack (from its Animate script), default Roblox animations otherwise
+		local a = g:FindFirstChild("Animate")
+		a = a and a:FindFirstChild(folderName)
+		a = a and a:FindFirstChild(animName)
+		return (a and a:IsA("Animation") and a.AnimationId ~= "") and a.AnimationId or default
+	end
+
+	local function hallucinate()
 		stopFx("hallucinate")
-		local function alive(ch)
-			local h = ch and ch:FindFirstChildOfClass("Humanoid")
-			return ch and ch.Parent and h and h.Health > 0
-		end
-		local src = sp.Character
-		if not alive(src) then -- sender gone: copy another active script user instead
-			src = nil
-			for uid in pairs(R.Banners or {}) do
-				local p = uid ~= Env.Player.UserId and Players:GetPlayerByUserId(uid)
-				if p and alive(p.Character) then
-					src = p.Character
-					break
-				end
-			end
-		end
-		if not src then return toast("Hallucination unavailable: no character to copy") end
+		local function usable(c) return c and c.Parent and c:FindFirstChild("HumanoidRootPart") and c:FindFirstChildOfClass("Humanoid") end
+		local ch = myChar()
+		if not usable(ch) then ch = Env.Player.Character end
+		if not usable(ch) then return toast("Hallucination unavailable: no character to copy") end
 		local g
-		local was = src.Archivable
-		src.Archivable = true
-		pcall(function() g = src:Clone() end)
-		src.Archivable = was
+		local was = ch.Archivable
+		ch.Archivable = true
+		pcall(function() g = ch:Clone() end)
+		ch.Archivable = was
 		local root = g and g:FindFirstChild("HumanoidRootPart")
-		if not (root and root:IsA("BasePart")) then
+		local hum = g and g:FindFirstChildOfClass("Humanoid")
+		if not (root and root:IsA("BasePart") and hum) then
 			if g then g:Destroy() end
 			return
 		end
+		local rig = hum.RigType == Enum.HumanoidRigType.R15 and "R15" or "R6"
+		local walkId, idleId = animId(g, "walk", "WalkAnim", RIG[rig].walk), animId(g, "idle", "Animation1", RIG[rig].idle)
+		local lift = math.max(hum.HipHeight + root.Size.Y / 2, 3)
 		local parts = {}
 		for _, d in ipairs(g:GetDescendants()) do
-			if d:IsA("BaseScript") or d:IsA("Sound") or d:IsA("BillboardGui") or d:IsA("ForceField") or d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Humanoid") then
-				d:Destroy()
-			elseif d:IsA("BasePart") then
-				d.Anchored, d.CanCollide, d.CanTouch, d.CanQuery, d.CastShadow = true, false, false, false, false
-				parts[#parts + 1] = {d, d.Transparency}
-			elseif d:IsA("Decal") then
-				parts[#parts + 1] = {d, d.Transparency}
-			end
+			pcall(function()
+				if d:IsA("BaseScript") or d:IsA("Sound") or d:IsA("BillboardGui") or d:IsA("ForceField") or d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Humanoid") then
+					d:Destroy()
+				elseif d:IsA("BasePart") then
+					d.CanCollide, d.CanTouch, d.CanQuery, d.CastShadow, d.Massless = false, false, false, false, true
+					d.Anchored = d == root -- only the root is anchored: the limbs follow it through their joints and can still animate
+					parts[#parts + 1] = {d, d.Transparency}
+					d.Transparency = 1
+				elseif d:IsA("Decal") then
+					parts[#parts + 1] = {d, d.Transparency}
+					d.Transparency = 1
+				end
+			end)
 		end
+		local ac = Instance.new("AnimationController")
+		ac.Parent = g
+		local an = Instance.new("Animator")
+		an.Parent = ac
 		g.PrimaryPart = root
-		local cf, size = g:GetBoundingBox()
-		local off = root.Position.Y - (cf.Position.Y - size.Y / 2)
-		local hl = Instance.new("Highlight")
-		hl.FillColor, hl.OutlineColor, hl.DepthMode = Color3.fromRGB(10, 10, 14), Color3.fromRGB(190, 200, 255), Enum.HighlightDepthMode.Occluded
-		hl.FillTransparency, hl.OutlineTransparency = 1, 1
-		hl.Parent = g
+		g.Name = "UhHauntCopy"
 		local folder = Instance.new("Folder")
 		folder.Name = "UhHaunt"
-		g.Name = "UhHauntCopy"
 		g.Parent = folder
+
 		local T = TIME.hallucinate
-		local ang, ph, startD, stopD = math.random() * math.pi * 2, math.random() * 6.28, 55 + math.random() * 20, 8 + math.random() * 5
-		local rp = RaycastParams.new()
-		rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+		local STEP_SPEED, STOP_D, SPAWN_D = 1.6, 5, 42 -- studs/s while stepping, stops this far from you, starts this far away
 		local okL, low = pcall(function() return Env.IsLowEnd and Env.IsLowEnd() end)
 		local interval = (okL and low) and 1 / 15 or 1 / 30 -- light on low-end devices
-		local t0, acc, gy, conn = os.clock(), interval, nil, nil
+		local rp = RaycastParams.new()
+		rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+		local t0 = os.clock()
+		local last, acc, gy, pos, lastFade = t0, interval, nil, nil, nil
+		local walk, idle, conn
+		local walking, phaseEnd = false, 1.5 + math.random()
+		local function setWalk(on)
+			walking = on
+			if on then
+				if idle then idle:Stop(0.25) end
+				if walk then walk:Play(0.25, 1, 0.35) end -- slow, small steps
+			else
+				if walk then walk:Stop(0.25) end
+				if idle then idle:Play(0.25) end
+			end
+		end
 		local function stop()
 			if conn then conn:Disconnect() end
+			pcall(function()
+				if walk then walk:Stop(0) end
+				if idle then idle:Stop(0) end
+			end)
 			folder:Destroy()
 		end
+		fx.hallucinate = stop
+		expire("hallucinate", stop, T) -- hard stop at exactly 60 s even if the frame loop stalls
+
 		local function step()
-			local t = os.clock() - t0
+			local now = os.clock()
+			local t, dt = now - t0, math.min(now - last, 0.25)
+			last = now
 			if t >= T or not folder.Parent then return stopFx("hallucinate") end
 			local me = myChar()
 			local tr = me and me:FindFirstChild("HumanoidRootPart")
 			if not tr then return end
-			local fade = math.min(1, t / 4, (T - t) / 4) -- fade in 4 s, fade out the last 4 s
-			local k = math.min(1, t / (T - 8)) -- creep: ~55-75 studs away at the start, 8-13 studs at the end
-			local d = stopD + (startD - stopD) * (1 - k)
-			local a = ang + 0.12 * math.sin(t * 0.35 + ph)
 			local c = tr.Position
-			local x, z = c.X + math.cos(a) * d, c.Z + math.sin(a) * d
-			rp.FilterDescendantsInstances = {folder, me}
-			local hit = workspace:Raycast(Vector3.new(x, c.Y + 8, z), Vector3.new(0, -40, 0), rp)
-			local y = hit and (hit.Position.Y + off) or c.Y
-			gy = gy and (gy + (y - gy) * 0.2) or y
-			g:PivotTo(CFrame.lookAt(Vector3.new(x, gy, z), Vector3.new(c.X, gy, c.Z)) * CFrame.Angles(0, 0, math.rad(3) * math.sin(t * 0.9 + ph)))
-			local amt = fade * 0.7 * (0.88 + 0.12 * math.sin(t * 6 + ph))
-			for _, pr in ipairs(parts) do
-				if pr[1].Parent then pr[1].Transparency = 1 - (1 - pr[2]) * amt end
+			if not pos or Vector3.new(pos.X - c.X, 0, pos.Z - c.Z).Magnitude > 70 then -- first frame, or you ran far off: appear ahead of you again
+				local cam = workspace.CurrentCamera
+				local lv = cam and cam.CFrame.LookVector or Vector3.new(0, 0, -1)
+				lv = Vector3.new(lv.X, 0, lv.Z)
+				lv = lv.Magnitude > 0.01 and lv.Unit or Vector3.new(0, 0, -1)
+				local d = (CFrame.Angles(0, math.rad(math.random(-25, 25)), 0) * lv) * SPAWN_D
+				pos = Vector3.new(c.X + d.X, c.Y, c.Z + d.Z)
 			end
-			hl.FillTransparency, hl.OutlineTransparency = 1 - 0.45 * fade, 1 - 0.35 * fade
+			local to = Vector3.new(c.X - pos.X, 0, c.Z - pos.Z)
+			local dist = to.Magnitude
+			if dist <= STOP_D then -- arrived: stands and watches
+				if walking then setWalk(false) end
+			elseif t >= phaseEnd then -- step / stop / step ...
+				if walking then
+					setWalk(false)
+					phaseEnd = t + 0.9 + math.random() * 0.9
+				else
+					setWalk(true)
+					phaseEnd = t + 0.8 + math.random() * 0.4
+				end
+			end
+			if walking and dist > STOP_D then pos += to.Unit * (STEP_SPEED * dt) end
+			rp.FilterDescendantsInstances = {folder, me, Env.Player.Character}
+			local hit = workspace:Raycast(Vector3.new(pos.X, c.Y + 8, pos.Z), Vector3.new(0, -40, 0), rp)
+			local y = hit and (hit.Position.Y + lift) or c.Y
+			gy = gy and (gy + (y - gy) * 0.25) or y
+			local at, here = Vector3.new(c.X, gy, c.Z), Vector3.new(pos.X, gy, pos.Z)
+			g:PivotTo(dist > 0.05 and CFrame.lookAt(here, at) or CFrame.new(here))
+			local fade = math.min(1, t / 3, (T - t) / 3) -- fade in 3 s, fade out the last 3 s
+			if fade ~= lastFade then
+				lastFade = fade
+				local amt = fade * 0.9
+				for _, pr in ipairs(parts) do
+					if pr[1].Parent then pr[1].Transparency = 1 - (1 - pr[2]) * amt end
+				end
+			end
 		end
-		fx.hallucinate = stop
-		expire("hallucinate", stop, T)
-		step()
+
 		folder.Parent = workspace.CurrentCamera or workspace
+		local function load(id, prio)
+			local a = Instance.new("Animation")
+			a.AnimationId = id
+			local ok, tr = pcall(function() return an:LoadAnimation(a) end)
+			if ok and tr then
+				tr.Looped, tr.Priority = true, prio
+				return tr
+			end
+		end
+		walk, idle = load(walkId, Enum.AnimationPriority.Movement), load(idleId, Enum.AnimationPriority.Idle)
+		if idle then idle:Play(0) end
+		step()
 		conn = RS.Heartbeat:Connect(function(dt)
 			acc += dt
 			if acc < interval then return end
@@ -308,7 +366,7 @@ return function(Env, R)
 			bring(sp)
 		elseif action == "hallucinate" then
 			toast(sp.Name .. " made you hallucinate (" .. TIME.hallucinate .. " s)")
-			hallucinate(sp)
+			hallucinate()
 		else
 			toast(sp.Name .. " made you dizzy (" .. TIME.dizzy .. " s)")
 			dizzy()
