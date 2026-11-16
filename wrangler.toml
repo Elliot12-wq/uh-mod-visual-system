@@ -5,6 +5,11 @@ workers_dev = true
 preview_urls = false
 keep_vars = true
 
+# Secrets (never in this file or the repo): `npx wrangler secret put NAME`
+#   DEVICE_HMAC_SECRET  required for permanent device bans (HMAC key for hashed device ids)
+#   DEVICE_BAN_KEY      owner secret for device ban / unban requests (falls back to OWNER_KEY)
+#   GUARD_MIN_VERSION   optional minimum guard version accepted by POST /guard (default 1)
+
 [[durable_objects.bindings]]
 name = "ROOM"
 class_name = "Room"

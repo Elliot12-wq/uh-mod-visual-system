@@ -1,17 +1,27 @@
--- Blacklist.lua | loads blacklist.json from the repo; lets OWNER / CO-OWNER add + remove entries (Yes/No warning each time)
+-- Blacklist.lua | loads the blacklist from the backend (GET /blacklist, falls back to blacklist.json in the repo); lets OWNER / CO-OWNER add + remove entries (Yes/No warning each time)
 -- Usage (main script, after Env is built):  local BL = loadstring(game:HttpGet(Base .. "Blacklist.lua"))()(Env)
--- Env needs: Player, Players, HttpService, Request, Base, Backend, OwnerKey (owner/co-owner only, from getgenv().UhBannerConfig.OwnerKey)
+-- Env needs: Player, Players, HttpService, Request, Base, Backend (owner / co-owner recognised by userId from roles.json on GitHub, no key)
 -- A blacklisted client kicks itself: "BLACKLISTED by the owner / co-owner" (checked at startup + every few seconds by B.Watch)
 return function(Env)
-	local B = {List = {}}
-	local ROLE_BY_NAME = {kingbaconnon19 = "owner", helloman1_23 = "co-owner"}
+	local B = {List = {}, Official = "uh-mod-visual-system"}
+	local function roleOfEntry(e) -- which rank blacklisted them: looked up in roles.json (Env.Roles), nothing hardcoded
+		local RL = Env.Roles
+		if not (RL and e) then return nil end
+		return RL.ById[math.floor(tonumber(e.byId) or 0)] or (e.by and RL.ByName[tostring(e.by):lower()]) or nil
+	end
 
 	function B.Fetch()
-		local ok, body = pcall(function() return game:HttpGet(Env.Base .. "blacklist.json?t=" .. os.time()) end)
-		if not ok then return false end
-		local ok2, data = pcall(Env.HttpService.JSONDecode, Env.HttpService, body)
-		if not ok2 or type(data) ~= "table" or type(data.entries) ~= "table" then return false end
-		B.List = data.entries
+		if B.Fresh and os.clock() - B.Fresh < 15 then return true end -- keep the list the backend just returned
+		local data
+		for _, url in ipairs({Env.Backend .. "/blacklist?t=" .. os.time(), Env.Base .. "blacklist.json?t=" .. os.time()}) do -- backend first (no GitHub token involved), repo file as fallback
+			local ok, body = pcall(function() return game:HttpGet(url) end)
+			if ok and type(body) == "string" then
+				local ok2, d = pcall(Env.HttpService.JSONDecode, Env.HttpService, body)
+				if ok2 and type(d) == "table" and type(d.entries) == "table" then data = d; break end
+			end
+		end
+		if not data then return false end
+		B.List = data.entries; B.Fresh = os.clock()
 		return true
 	end
 
@@ -23,7 +33,7 @@ return function(Env)
 	end
 
 	function B.KickText(e)
-		local who = e and e.by and ROLE_BY_NAME[tostring(e.by):lower()] or "owner/co-owner"
+		local who = roleOfEntry(e) or "owner/co-owner"
 		return "BLACKLISTED by the " .. who
 	end
 
@@ -45,35 +55,49 @@ return function(Env)
 		if B.Watching then return end
 		B.Watching = true
 		task.spawn(function()
+			local rounds = 0
 			while B.Watching do
-				for _ = 1, 32 do if not B.Watching then return end task.wait(0.25) end
+				for _ = 1, 80 do if not B.Watching then return end task.wait(0.25) end
 				if B.Fetch() then B.Enforce() end
+				rounds += 1
+				if rounds % 15 == 0 and Env.Guard and Env.Guard.Recheck then pcall(Env.Guard.Recheck) end -- device ban / backend handshake re-check about every 5 min (a failed request never bans anyone)
 			end
 		end)
 	end
 
 	local function post(path, extra)
 		if not Env.Request then return false, "executor has no request()" end
-		if not Env.OwnerKey or Env.OwnerKey == "" then return false, "owner / co-owner only" end
-		local body = {key = Env.OwnerKey, by = Env.Player.Name, byId = Env.Player.UserId}
+		if not (Env.IsOwner and Env.IsOwner()) then return false, "owner / co-owner only" end
+		local body = {room = Env.Room, by = Env.Player.Name, byId = Env.Player.UserId}
 		for k, v in pairs(extra) do body[k] = v end
+		if body.banDevice or path:sub(1, 8) == "/device/" then -- permanent device bans also need the owner secret set on the backend (read from UhBannerConfig.OwnerKey, never stored in this script)
+			local okC, c = pcall(function() return (getgenv and getgenv().UhBannerConfig or {}).OwnerKey end)
+			if okC and type(c) == "string" and c ~= "" then body.key = c end
+		end
+		if Env.Sign then Env.Sign(path, body, tostring(extra.userId)) end
 		local ok, res = pcall(Env.Request, {
 			Url = Env.Backend .. path, Method = "POST",
 			Headers = {["Content-Type"] = "application/json"},
 			Body = Env.HttpService:JSONEncode(body),
 		})
 		if not ok then return false, tostring(res) end
-		if type(res) ~= "table" or res.StatusCode ~= 200 then return false, "HTTP " .. tostring(type(res) == "table" and res.StatusCode) end
-		B.Fetch()
-		return true
+		local okJ, data = pcall(Env.HttpService.JSONDecode, Env.HttpService, type(res) == "table" and res.Body or "")
+		if not okJ or type(data) ~= "table" then data = nil end
+		if type(res) ~= "table" or res.StatusCode ~= 200 then return false, "HTTP " .. tostring(type(res) == "table" and res.StatusCode) .. ((data and data.error) and (": " .. tostring(data.error)) or "") end
+		if data and type(data.entries) == "table" then B.List = data.entries; B.Fresh = os.clock() else B.Fetch() end -- the backend returns the new list: use it
+		return true, nil, data
 	end
 
-	function B.Add(userId, username, reason)
-		return post("/blacklist", {userId = userId, username = username, reason = reason or ""})
+	function B.Add(userId, username, reason, banDevice) -- banDevice: also ban the account's device(s) permanently (owner secret required on the backend)
+		return post("/blacklist", {userId = userId, username = username, reason = reason or "", banDevice = banDevice == true or nil})
 	end
 
-	function B.Remove(userId) -- unblacklist (mistakes)
+	function B.Remove(userId) -- unblacklist (mistakes); a device ban is NOT lifted by this, it needs B.DeviceUnban
 		return post("/unblacklist", {userId = userId})
+	end
+
+	function B.DeviceUnban(userId) -- explicit, owner-authorised removal of the permanent device ban(s) recorded for an account
+		return post("/device/unban", {userId = userId})
 	end
 
 	local function toast(msg)
@@ -81,43 +105,64 @@ return function(Env)
 	end
 
 	-- Yes/No warning dialog. cb runs only on "Yes".
-	local function dialog(text, cb)
+	local function dialog(text, cb, cb2, label2)
 		local gui = Instance.new("ScreenGui")
 		gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "UhBlacklistConfirm", false, 1000
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
 		local f = Instance.new("Frame", gui)
-		f.Size, f.Position, f.AnchorPoint = UDim2.fromOffset(300, 150), UDim2.fromScale(0.5, 0.5), Vector2.new(0.5, 0.5)
+		f.Size, f.Position, f.AnchorPoint = UDim2.fromOffset(300, cb2 and 180 or 150), UDim2.fromScale(0.5, 0.5), Vector2.new(0.5, 0.5)
 		f.BackgroundColor3, f.BorderSizePixel = Color3.fromRGB(24, 24, 30), 0
 		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
 		local t = Instance.new("TextLabel", f)
-		t.Size, t.Position, t.BackgroundTransparency = UDim2.new(1, -20, 0, 84), UDim2.fromOffset(10, 8), 1
+		t.Size, t.Position, t.BackgroundTransparency = UDim2.new(1, -20, 0, cb2 and 114 or 84), UDim2.fromOffset(10, 8), 1
 		t.TextWrapped, t.TextColor3, t.Font, t.TextSize = true, Color3.new(1, 1, 1), Enum.Font.GothamMedium, 14
 		t.Text = text
-		local function btn(txt, x, col, fn)
+		local function btn(txt, x, w, col, fn)
 			local b = Instance.new("TextButton", f)
-			b.Size, b.Position, b.Text = UDim2.fromOffset(130, 36), UDim2.fromOffset(x, 100), txt
-			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = col, Color3.new(1, 1, 1), Enum.Font.GothamBold, 15
+			b.Size, b.Position, b.Text = UDim2.fromOffset(w, 36), UDim2.fromOffset(x, cb2 and 130 or 100), txt
+			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = col, Color3.new(1, 1, 1), Enum.Font.GothamBold, (w < 120) and 13 or 15
 			Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
 			b.Activated:Connect(function() gui:Destroy(); fn() end)
 		end
-		btn("Yes", 15, Color3.fromRGB(200, 60, 60), cb)
-		btn("No", 155, Color3.fromRGB(70, 70, 80), function() end)
+		if cb2 then
+			btn("Yes", 10, 84, Color3.fromRGB(200, 60, 60), cb)
+			btn(label2 or "Yes + Device", 100, 110, Color3.fromRGB(150, 40, 40), cb2)
+			btn("No", 216, 74, Color3.fromRGB(70, 70, 80), function() end)
+		else
+			btn("Yes", 15, 130, Color3.fromRGB(200, 60, 60), cb)
+			btn("No", 155, 130, Color3.fromRGB(70, 70, 80), function() end)
+		end
 	end
 
 	-- onDone(ok, err) is called after the request finishes (not called on "No").
 	function B.Confirm(userId, username, onDone)
-		dialog(("WARNING\nBlacklist %s (@%s)?\nThey will be blocked from using this script and kicked from the game."):format(username, username), function()
+		local function go(withDevice)
 			task.spawn(function()
-				local ok, err = B.Add(userId, username)
+				local ok, err, data = B.Add(userId, username, nil, withDevice)
 				if onDone then onDone(ok, err) end
+				if ok and withDevice then
+					local d = data and data.device
+					local st = d and d.status
+					toast(st == "banned" and "Device ban applied" or st == "pending" and "No device on record yet: it is banned the next time this account launches the script" or st == "protected" and "Device ban skipped: that device is shared with an owner / moderator account" or ("Device ban not applied" .. ((d and d.error) and (": " .. tostring(d.error)) or "")))
+				end
 			end)
-		end)
+		end
+		dialog(("WARNING\nBlacklist %s (@%s)?\nThey will be blocked from using this script and kicked from the game.\n\"Yes + Device\" also bans their device permanently."):format(username, username), function() go(false) end, function() go(true) end)
 	end
 
 	function B.ConfirmRemove(userId, username, onDone)
 		dialog(("Unblacklist %s (@%s)?\nThey will be able to use this script again."):format(username, username), function()
 			task.spawn(function()
 				local ok, err = B.Remove(userId)
+				if onDone then onDone(ok, err) end
+			end)
+		end)
+	end
+
+	function B.ConfirmDeviceRemove(userId, username, onDone)
+		dialog(("Remove the permanent device ban recorded for %s (@%s)?\nThe account blacklist stays as it is."):format(username, username), function()
+			task.spawn(function()
+				local ok, err = B.DeviceUnban(userId)
 				if onDone then onDone(ok, err) end
 			end)
 		end)
@@ -134,7 +179,7 @@ return function(Env)
 			gui.Parent = Env.Player:WaitForChild("PlayerGui")
 			B.Panel = gui
 			local f = Instance.new("Frame", gui)
-			f.Size, f.Position, f.AnchorPoint = UDim2.fromOffset(320, 300), UDim2.fromScale(0.5, 0.5), Vector2.new(0.5, 0.5)
+			f.Size, f.Position, f.AnchorPoint = UDim2.fromOffset(380, 300), UDim2.fromScale(0.5, 0.5), Vector2.new(0.5, 0.5)
 			f.BackgroundColor3, f.BorderSizePixel = Color3.fromRGB(24, 24, 30), 0
 			Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
 			local t = Instance.new("TextLabel", f)
@@ -160,7 +205,7 @@ return function(Env)
 				row.Size, row.BackgroundColor3, row.BorderSizePixel, row.LayoutOrder = UDim2.new(1, -6, 0, 38), Color3.fromRGB(34, 34, 42), 0, i
 				Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 				local l = Instance.new("TextLabel", row)
-				l.Size, l.Position, l.BackgroundTransparency, l.Text = UDim2.new(1, -118, 1, 0), UDim2.fromOffset(10, 0), 1, name
+				l.Size, l.Position, l.BackgroundTransparency, l.Text = UDim2.new(1, -200, 1, 0), UDim2.fromOffset(10, 0), 1, name
 				l.TextColor3, l.Font, l.TextSize, l.TextXAlignment, l.TextTruncate = Color3.new(1, 1, 1), Enum.Font.GothamMedium, 13, Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
 				local u = Instance.new("TextButton", row)
 				u.Size, u.Position, u.Text = UDim2.fromOffset(100, 26), UDim2.new(1, -106, 0.5, -13), "Unblacklist"
@@ -172,6 +217,14 @@ return function(Env)
 						toast(ok and (name .. " unblacklisted") or ("failed: " .. tostring(err)))
 						if ok and B.Panel then B.OpenPanel() end
 					end)
+				end)
+				local dv = Instance.new("TextButton", row)
+				dv.Size, dv.Position, dv.Text = UDim2.fromOffset(88, 26), UDim2.new(1, -198, 0.5, -13), "Unban device"
+				dv.BackgroundColor3, dv.TextColor3, dv.Font, dv.TextSize = Color3.fromRGB(150, 110, 40), Color3.new(1, 1, 1), Enum.Font.GothamBold, 11
+				Instance.new("UICorner", dv).CornerRadius = UDim.new(0, 6)
+				dv.Activated:Connect(function()
+					if not uid then return end
+					B.ConfirmDeviceRemove(uid, name, function(ok, err) toast(ok and "Device ban removed" or ("failed: " .. tostring(err))) end)
 				end)
 			end
 		end)
@@ -185,7 +238,7 @@ return function(Env)
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
 		B.PillGui = gui
 		local b = Instance.new("TextButton", gui)
-		b.AnchorPoint, b.Position, b.Size, b.Text = Vector2.new(0, 0.5), UDim2.new(0, 8, 0.5, 38), UDim2.fromOffset(118, 30), "Blacklist"
+		b.AnchorPoint, b.Position, b.Size, b.Text = Vector2.new(0, 0.5), UDim2.new(0, 8, 0.5, 38), UDim2.fromOffset(118, 30), "Blacklist (unban)"
 		b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.BorderSizePixel = Color3.fromRGB(24, 24, 30), Color3.new(1, 1, 1), Enum.Font.GothamBold, 12, 0
 		Instance.new("UICorner", b).CornerRadius = UDim.new(1, 0)
 		local s = Instance.new("UIStroke", b)

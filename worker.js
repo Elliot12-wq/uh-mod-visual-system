@@ -2,21 +2,33 @@
 // One Room Durable Object per Roblox server ("placeId-jobId") holds that server's banners, commands and Alt-Fling state.
 // One extra Room instance named "~meta" (a name no real room can have) holds the global state: one-time key claims, owner ids and blacklist edits.
 // A third instance named "~bc" holds the owner broadcast (announcements every running copy of the script shows in its notification UI).
-// API: GET /banners /commands /alt /poll   POST /banner /clear /mod /alt /verify /blacklist /unblacklist /send
+// API: GET /banners /commands /alt /poll   POST /banner /clear /mod /alt /verify /blacklist /unblacklist /send /guard /device/ban /device/unban
+// Device bans: /guard (startup handshake + device check, called by every script copy), /device/ban + /device/unban (owner / co-owner only). A device id (gethwid) is only ever stored as HMAC-SHA256(DEVICE_HMAC_SECRET, id) inside the "~meta" Durable Object: never in GitHub, logs or responses.
 // Secrets / vars (Workers > Settings > Variables and Secrets, or `wrangler secret put NAME`):
 //   MOD_KEYS (JSON array of one-time keys), OWNER_KEY, OWNER_IDS (JSON array of userIds), GITHUB_TOKEN (Contents: read + write on the repo),
 //   GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json),
 //   BROADCAST_KEY (optional: Bearer key for POST /send; falls back to OWNER_KEY)
+//   DEVICE_HMAC_SECRET (required for device bans: long random string, `wrangler secret put DEVICE_HMAC_SECRET`; never put it in the script or the repo)
+//   DEVICE_BAN_KEY (owner secret that device ban / unban requests must carry in `key`, together with an owner / co-owner userId; falls back to OWNER_KEY)
+//   GUARD_MIN_VERSION (optional: /guard rejects script copies whose guard version is lower; default 1)
 const ID = /^\d{1,16}$/, ROOM = /^[0-9A-Za-z:_-]{1,80}$/, IMG = /^(rbxassetid:\/\/)?\d{1,19}$/;
 const TTL = 75000, CMD_TTL = 30000, ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000, BC_COOLDOWN = 2000, BC_KEEP = 50;
 // Effects (Bring Users / Hallucinate Users / Dizzy) use the same /mod path as kill / deanimate / kick: no recipient consent step and no cooldown. The recipient's client runs them and cleans them up (hallucinate 60 s, dizzy 20 s).
 const FX_ACTIONS = new Set(["bring", "hallucinate", "dizzy"]), FX_QUEUE_MAX = 25; // FX_QUEUE_MAX = storage guard on one target's command queue (drained every few seconds), not a cooldown
 const ACTIONS = new Set(["kill", "deanimate", "kick", ...FX_ACTIONS]), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
+const NONCE = /^[0-9a-f]{16,64}$/, DEV_LINK_MAX = 5, DEV_IP_PER_HOUR = 20; // DEV_LINK_MAX = device hashes remembered per account, DEV_IP_PER_HOUR = new device links one IP may create per hour (storage guard)
+const HW_PLACEHOLDER = new Set(["unknown", "undefined", "default", "null", "none", "nil", "error", "failed", "unsupported", "notsupported", "hwid"]);
+const normHwid = (v) => { // same normalisation as Util.Guard.Norm in the script: anything unusable returns null and can never cause a ban
+  if (typeof v !== "string") return null;
+  v = v.trim().toLowerCase().replace(/^[{"']+|[}"']+$/g, "");
+  if (!/^[0-9a-z][0-9a-z_.:-]{7,127}$/.test(v) || new Set(v).size < 6 || HW_PLACEHOLDER.has(v)) return null;
+  return v;
+};
 const OWNER_NAMES = ["kingbaconnon19", "helloman1_23"];
 const BROADCAST_USER = "Kingbaconnon19"; // the only account name /send accepts (same check the Lua owner panel uses)
-const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048, "/send": 4096 };
+const POST_LIMIT = { "/banner": 2048, "/clear": 2048, "/mod": 2048, "/alt": 1024, "/verify": 1024, "/blacklist": 2048, "/unblacklist": 2048, "/send": 4096, "/guard": 1024, "/device/ban": 2048, "/device/unban": 2048 };
 const GET_ROOM = new Set(["/banners", "/commands", "/alt"]);
-const META_PATHS = new Set(["/verify", "/blacklist", "/unblacklist"]);
+const META_PATHS = new Set(["/verify", "/blacklist", "/unblacklist", "/guard", "/device/ban", "/device/unban"]);
 const s = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, n);
 const HEX = /^#[0-9a-fA-F]{6}$/;
 const ni = (v, lo, hi, d) => { v = Math.round(Number(v)); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
@@ -41,7 +53,7 @@ export default {
       if (txt.length > POST_LIMIT[p]) return j(413, { error: "too large" });
       let b; try { b = JSON.parse(txt); } catch { return j(400, { error: "bad json" }); }
       if (!b || typeof b !== "object") return j(400, { error: "bad json" });
-      if (META_PATHS.has(p)) stub = env.ROOM.get(env.ROOM.idFromName("~meta"));
+      if (META_PATHS.has(p)) { stub = env.ROOM.get(env.ROOM.idFromName("~meta")); init.headers = { "X-Ip": req.headers.get("CF-Connecting-IP") || "" }; }
       else if (p === "/send") { // owner broadcast: checked here so a bad caller never wakes the Durable Object
         const key = env.BROADCAST_KEY || env.OWNER_KEY || "", tok = (req.headers.get("Authorization") || "").replace(/^Bearer /, "");
         if (key === "" || !same(tok, key) || b.user !== BROADCAST_USER) return j(403, {});
@@ -68,6 +80,7 @@ export class Room {
     this.dirty = false; this.blLock = Promise.resolve();
     this.lastCmd = new Map(); this.lastAlt = new Map(); this.lastVerify = new Map(); this.nameIds = new Map(); this.rost = null;
     this.mods = { ids: new Set(), at: 0 }; this.lastBc = 0;
+    this.lastGuard = new Map(); this.devIp = new Map(); this.hk = null; // meta only: /guard rate limit, new-device-link limiter per IP, cached HMAC key
     state.blockConcurrencyWhile(async () => {
       const g = await this.st.get(["m", "c", "a", "claims", "owners", "bc"]);
       this.bc = g.get("bc") || { last: 0, msgs: [] }; // "~bc" only: owner broadcast, last id + the newest BC_KEEP announcements [{id, text}]
@@ -168,6 +181,8 @@ export class Room {
   async meta(req, p) {
     if (p === "/_/mods") return j(200, { ids: [...(await this.modIds())] });
     const b = await req.json(), now = Date.now();
+    if (p === "/guard") return this.guard(req, b, now);
+    if (p === "/device/ban" || p === "/device/unban") return this.deviceAdmin(p, b, now);
     if (p === "/_/auth") { // used by room instances: mode "owner" (owner id / owner key) or anything else = moderator (owner or one-time key)
       const ok = b.mode === "owner" ? await this.ownerOk(b.userId, b.key) : await this.modAuth(String(b.userId), b.key);
       return j(200, { ok });
@@ -191,10 +206,101 @@ export class Room {
       const mutate = p === "/blacklist"
         ? (list) => list.some((x) => String(x.userId) === target) ? null : [...list, { userId: +target, username: s(b.username, 40), by: s(b.by, 40), reason: s(b.reason, 100), ts: now }]
         : (list) => { const next = list.filter((x) => String(x.userId) !== target); return next.length === list.length ? null : next; };
-      try { return j(200, { ok: true, entries: await this.locked(() => this.editBlacklist(mutate)) }); }
+      try {
+        const out = { ok: true, entries: await this.locked(() => this.editBlacklist(mutate)) };
+        if (p === "/blacklist" && b.banDevice === true) out.device = await this.deviceFor(by, target, b.key); // optional: also ban the account's device(s); needs the owner secret, works for an account that was already blacklisted too
+        return j(200, out);
+      }
       catch (err) { return j(502, { error: String((err && err.message) || err).slice(0, 120) }); }
     }
     return j(404, { error: "not found" });
+  }
+
+  // ===== permanent device bans + startup handshake (the "~meta" instance) =====
+  // gethwid() is executor-provided: it is only a lookup key, never an authentication secret, and it can be spoofed or can change. The raw id is turned into
+  // HMAC-SHA256(DEVICE_HMAC_SECRET, id) immediately and is never stored, logged, returned or written to GitHub. Durable Object records:
+  //   dl:<userId> = up to DEV_LINK_MAX device hashes seen for that account    db:<hash> = permanent device ban {ts, by, uid} (no expiry, removed only by /device/unban)
+  //   da:<userId> = the owner banned this account's device before any was on record: the first device it shows up with is banned
+  async hmac(msg) {
+    const secret = this.env.DEVICE_HMAC_SECRET || "", te = new TextEncoder();
+    if (!this.hk || this.hk.s !== secret) this.hk = { s: secret, k: await crypto.subtle.importKey("raw", te.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]) };
+    return [...new Uint8Array(await crypto.subtle.sign("HMAC", this.hk.k, te.encode("uh-device-v1|" + msg)))].map((x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  async protectedHashes() { // devices seen on owner / co-owner / verified accounts are never banned through some other account
+    const ids = [...(await this.modIds())].slice(0, 120), out = new Set();
+    if (ids.length) for (const v of (await this.st.get(ids.map((i) => "dl:" + i))).values()) for (const h of v || []) out.add(h);
+    return out;
+  }
+  async banHash(h, by, uid, prot) { // one record per device hash: no duplicates
+    if (prot.has(h)) return "protected";
+    if (await this.st.get("db:" + h)) return "exists";
+    await this.st.put("db:" + h, { ts: Date.now(), by: String(by), uid: String(uid) });
+    return "banned";
+  }
+  async deviceBan(target, by) {
+    const links = (await this.st.get("dl:" + target)) || [];
+    if (!links.length) { await this.st.put("da:" + target, { ts: Date.now(), by: String(by) }); return { status: "pending", linked: 0 }; }
+    const prot = await this.protectedHashes(); let added = 0, kept = 0, skipped = 0;
+    for (const h of links) { const r = await this.banHash(h, by, target, prot); if (r === "banned") added++; else if (r === "exists") kept++; else skipped++; }
+    return { status: added || kept ? "banned" : "protected", linked: links.length, added, skipped };
+  }
+  async deviceUnban(target) { // removes the ban records created for this account (plus a pending one); nothing else
+    let removed = 0;
+    for (const [k, v] of await this.st.list({ prefix: "db:", limit: 2000 })) if (v && String(v.uid) === target && (await this.st.delete(k))) removed++;
+    await this.st.delete("da:" + target);
+    return { removed };
+  }
+  async devAuth(by, key) { // an owner / co-owner userId AND the owner secret kept on the backend: a userId alone can be claimed by anyone, so it never authorises a permanent ban
+    const e = this.env, secret = e.DEVICE_BAN_KEY || e.OWNER_KEY || "";
+    if (!e.DEVICE_HMAC_SECRET) return { code: 503, error: "DEVICE_HMAC_SECRET is not set on the backend" };
+    if (secret === "") return { code: 503, error: "DEVICE_BAN_KEY (or OWNER_KEY) is not set on the backend" };
+    if (!(await this.owners()).has(by) || !same(typeof key === "string" ? key : "", secret)) return { code: 403, error: "owner / co-owner only" };
+    return null;
+  }
+  async deviceFor(by, target, key) { // device part of /blacklist: never turns a successful account blacklist into an error
+    try { const bad = await this.devAuth(by, key); return bad ? { status: "denied", error: bad.error } : await this.deviceBan(target, by); }
+    catch { return { status: "error" }; }
+  }
+  async deviceAdmin(p, b, now) { // POST /device/ban | /device/unban { byId, key, userId }
+    const by = String(b.byId), target = String(b.userId);
+    if (!ID.test(by) || !ID.test(target)) return j(400, { error: "bad" });
+    const bad = await this.devAuth(by, b.key);
+    if (bad) return j(bad.code, { error: bad.error });
+    if (now - (this.lastCmd.get("dv" + by) || 0) < 1000) return j(429, { error: "slow down" });
+    this.lastCmd.set("dv" + by, now);
+    try {
+      if (p === "/device/unban") return j(200, { ok: true, device: await this.deviceUnban(target) });
+      if (target === by || (await this.modIds()).has(target)) return j(403, { error: "immune" });
+      return j(200, { ok: true, device: await this.deviceBan(target, by) });
+    } catch (err) { return j(502, { error: String((err && err.message) || err).slice(0, 120) }); }
+  }
+  async guard(req, b, now) { // POST /guard { userId, nonce, gv, hwid? } -> { ok, nonce, allow, reason?, device }
+    const id = String(b.userId), nonce = String(b.nonce || "");
+    if (!ID.test(id) || !NONCE.test(nonce)) return j(400, { error: "bad" });
+    if (now - (this.lastGuard.get(id) || 0) < 1000) return j(429, { error: "slow down" });
+    if (this.lastGuard.size > 5000) this.lastGuard.clear();
+    this.lastGuard.set(id, now);
+    const gv = Math.floor(Number(b.gv)) || 0, min = Math.floor(Number(this.env.GUARD_MIN_VERSION)) || 1;
+    if (gv < min) return j(200, { ok: true, nonce, allow: false, reason: "rejected" }); // explicit rejection of an outdated / non-official script copy
+    let device = "none"; // none = no usable id from this client (never a ban), off = backend not configured for device bans, ok = checked
+    const hw = normHwid(b.hwid);
+    if (hw && this.env.DEVICE_HMAC_SECRET) {
+      const h = await this.hmac(hw), g = await this.st.get(["db:" + h, "dl:" + id, "da:" + id]), links = g.get("dl:" + id) || [];
+      if (g.get("db:" + h)) return j(200, { ok: true, nonce, allow: false, reason: "device_banned" });
+      if (!links.includes(h)) { // new device for this account: one write, only when it is new, limited per IP so the store cannot be flooded
+        const ip = req.headers.get("X-Ip") || "", rec = this.devIp.get(ip);
+        if (this.devIp.size > 2000) this.devIp.clear();
+        if (!rec || now - rec.t > 3600000) this.devIp.set(ip, { t: now, n: 1 }); else rec.n++;
+        if (this.devIp.get(ip).n <= DEV_IP_PER_HOUR) await this.st.put("dl:" + id, [...links, h].slice(-DEV_LINK_MAX));
+      }
+      const flag = g.get("da:" + id);
+      if (flag) { // the owner banned this account's device before one was on record: the first device it shows up with is banned now
+        await this.st.delete("da:" + id);
+        if ((await this.banHash(h, flag.by, id, await this.protectedHashes())) === "banned") return j(200, { ok: true, nonce, allow: false, reason: "device_banned" });
+      }
+      device = "ok";
+    } else if (hw) device = "off";
+    return j(200, { ok: true, nonce, allow: true, device });
   }
 
   // ===== owner broadcast (the "~bc" instance; /send was already authorised by the front Worker) =====
