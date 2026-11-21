@@ -15,7 +15,7 @@
 const ID = /^\d{1,16}$/, ROOM = /^[0-9A-Za-z:_-]{1,80}$/, IMG = /^(rbxassetid:\/\/)?\d{1,19}$/;
 const TTL = 75000, CMD_TTL = 30000, ALT_REQ_TTL = 120000, ALT_EV_TTL = 60000, BC_COOLDOWN = 2000, BC_KEEP = 50;
 // Effects (Bring Users / Hallucinate Users / Dizzy) use the same /mod path as kill / deanimate / kick: no recipient consent step and no cooldown. The recipient's client runs them and cleans them up (hallucinate 60 s, dizzy 20 s).
-const FX_ACTIONS = new Set(["bring", "hallucinate", "dizzy", "silenthell"]), FX_QUEUE_MAX = 25; // FX_QUEUE_MAX = storage guard on one target's command queue (drained every few seconds), not a cooldown
+const FX_ACTIONS = new Set(["bring", "hallucinate", "dizzy", "silenthell", "dropbomb"]), FX_QUEUE_MAX = 25; // FX_QUEUE_MAX = storage guard on one target's command queue (drained every few seconds), not a cooldown
 const ACTIONS = new Set(["kill", "deanimate", "kick", ...FX_ACTIONS]), ALT_RESULTS = new Set(["confirmed", "unconfirmed", "failed"]);
 const NONCE = /^[0-9a-f]{16,64}$/, DEV_LINK_MAX = 5, DEV_IP_PER_HOUR = 20; // DEV_LINK_MAX = device hashes remembered per account, DEV_IP_PER_HOUR = new device links one IP may create per hour (storage guard)
 const HW_PLACEHOLDER = new Set(["unknown", "undefined", "default", "null", "none", "nil", "error", "failed", "unsupported", "notsupported", "hwid"]);

@@ -10,10 +10,11 @@ return function(Env, R)
 	local Players, RS, HS = Env.Players, Env.RunService, Env.HttpService
 	local genv = (getgenv and getgenv()) or _G
 	local F = {Enabled = genv.UhFxEnabled ~= false}
-	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true}
-	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10}
-	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10} -- default effect lengths (TIME may be overridden per command by F.Run)
-	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}}
+	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true}
+	local BOMB_LIFE = 10.0 -- Drop Bomb: explosion lifetime in seconds, counted from the detonation (the fall is not part of it)
+	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE}
+	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE} -- default effect lengths (TIME may be overridden per command by F.Run)
+	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}, {key = "dropbomb", label = "Drop Bomb"}}
 	F.Time = TIME
 
 	-- ===== permissions: the single gate =====
@@ -551,6 +552,313 @@ return function(Env, R)
 		end)
 	end
 
+	-- ===== Drop Bomb =====
+	-- A locally built bomb (Parts / emitters only, nothing replicated) falls from 35 studs above THIS client's active character (myChar()), tracks it while spinning and detonates the moment its nose reaches the
+	-- character (character position + ground raycast, no Touched). At that instant the layered explosion starts and the existing Env.ModActions.Kill runs exactly once. The explosion lives in its own Workspace
+	-- folder for EXACTLY BOMB_LIFE = 10.0 s counted from detonation (the fall is NOT part of it) and survives the respawn the Kill causes. ONE stop function cleans up every exit (10 s expiry, re-trigger,
+	-- respawn BEFORE impact, FX disabled, unload, lost character); only an impact kills. Sound = the engine's built-in explosion sample (rbxasset://, no external asset ids; silent if the client lacks it).
+	local function dropbomb()
+		stopFx("dropbomb")
+		if not F.Enabled then return end
+		local cam = workspace.CurrentCamera
+		local me0 = myChar()
+		local root0 = me0 and me0:FindFirstChild("HumanoidRootPart")
+		if not (cam and root0) then return toast("Drop Bomb unavailable: no character") end
+		local TS = Env.TweenService or game:GetService("TweenService")
+		local ES, ED, C = Enum.EasingStyle, Enum.EasingDirection, Color3.fromRGB
+		local okL, low = pcall(function() return Env.IsLowEnd and Env.IsLowEnd() end)
+		low = okL and low == true
+		local Q, interval = low and 0.5 or 1, low and 1 / 30 or 0 -- low-end: half the particles, 30 Hz fall loop
+		local FALL_H, FALL_MAX, NOSE, SHAKE = 35, 4, 4.1, 0.7 -- start height, fall safety limit (s), centre-to-nose distance of the bomb, camera shake length (s)
+		local folder = Instance.new("Folder")
+		folder.Name = "UhDropBomb"
+		local tw, conn, cconn, snd, bomb = {}, nil, nil, nil, nil
+		local dead, detonated, shaking, applied, shakeT0 = false, false, false, nil, 0
+		local lastMe, lost, gy, n = me0, nil, nil, 0
+		local rp = RaycastParams.new()
+		rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+		rp.FilterDescendantsInstances = {folder, me0, Env.Player.Character}
+
+		local function tween(o, secs, props, style, dir, delay, rep, rev)
+			pcall(function()
+				local x = TS:Create(o, TweenInfo.new(secs, style or ES.Quad, dir or ED.Out, rep or 0, rev or false, delay or 0), props)
+				tw[#tw + 1] = x
+				x:Play()
+			end)
+		end
+		local function ns(...)
+			local a, k = {...}, {}
+			for i = 1, #a, 2 do k[#k + 1] = NumberSequenceKeypoint.new(a[i], a[i + 1]) end
+			return NumberSequence.new(k)
+		end
+		local function cs(...)
+			local a, k = {...}, {}
+			for i = 1, #a, 2 do k[#k + 1] = ColorSequenceKeypoint.new(a[i], a[i + 1]) end
+			return ColorSequence.new(k)
+		end
+		local function mk(parent, name, shape, size, cf, color, mat, tr) -- anchored, non-colliding, non-queryable cosmetic part
+			local p = Instance.new("Part")
+			p.Shape = shape
+			p.Name, p.Size, p.Color, p.Material, p.Transparency = name, size, color, mat, tr or 0
+			p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.CastShadow, p.Massless = true, false, false, false, false, true
+			p.TopSurface, p.BottomSurface, p.CFrame = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth, cf
+			p.Parent = parent
+			return p
+		end
+		local function groundAt(p) -- ground height below a point (nil when nothing is hit)
+			local hit = workspace:Raycast(p + Vector3.new(0, 4, 0), Vector3.new(0, -500, 0), rp)
+			return hit and hit.Position.Y
+		end
+
+		-- camera shake: offset applied after the camera update and removed before the next one (same pattern as Dizzy); ends by itself after SHAKE seconds, the camera is never changed permanently
+		local function undo()
+			if applied then
+				if cam.Parent then cam.CFrame = cam.CFrame * applied:Inverse() end
+				applied = nil
+			end
+		end
+		local function unshake()
+			if shaking then
+				shaking = false
+				pcall(function() RS:UnbindFromRenderStep("UhFxDropBombPost") end)
+				pcall(function() RS:UnbindFromRenderStep("UhFxDropBombPre") end)
+			end
+			pcall(undo)
+		end
+		local function shake()
+			if shaking then return end
+			shaking, shakeT0 = true, os.clock()
+			RS:BindToRenderStep("UhFxDropBombPre", Enum.RenderPriority.First.Value, function()
+				if not pcall(undo) then unshake() end
+			end)
+			RS:BindToRenderStep("UhFxDropBombPost", Enum.RenderPriority.Camera.Value + 1, function()
+				local t = os.clock() - shakeT0
+				if t >= SHAKE or workspace.CurrentCamera ~= cam then return unshake() end
+				local k = (1 - t / SHAKE) ^ 2 -- decays to exactly 0
+				local off = CFrame.new(math.noise(t * 31, 1.5, 0) * 1.4 * k, math.noise(t * 29, 8.5, 0) * 1.4 * k, 0) * CFrame.Angles(0, 0, math.rad(2) * math.noise(t * 23, 4.5, 0) * k)
+				cam.CFrame = cam.CFrame * off
+				applied = off
+			end)
+		end
+
+		-- the ONE cleanup
+		local function stop()
+			if dead then return end
+			dead = true
+			if conn then conn:Disconnect(); conn = nil end
+			if cconn then cconn:Disconnect(); cconn = nil end
+			pcall(unshake)
+			for _, x in ipairs(tw) do pcall(function() x:Cancel() end) end
+			table.clear(tw)
+			if snd then pcall(function() snd:Stop(); snd:Destroy() end); snd = nil end
+			pcall(function() folder:Destroy() end) -- bomb, parts, rings, emitters, lights: everything lives under this folder
+		end
+		fx.dropbomb = stop
+
+		-- the bomb: dark metal body + domed nose, banded and riveted, brass fuse assembly with a pulsing glowing indicator, four swept stabilising fins, suspension lugs (nose points down, -Y)
+		local function buildBomb()
+			local m = Instance.new("Model")
+			m.Name = "UhBomb"
+			local DARK, STEEL, BRASS, RED = C(32, 34, 40), C(112, 118, 128), C(184, 142, 58), C(196, 38, 30)
+			local METAL, PLATE = Enum.Material.Metal, Enum.Material.DiamondPlate
+			local BLOCK, BALL, CYL = Enum.PartType.Block, Enum.PartType.Ball, Enum.PartType.Cylinder
+			local UP = CFrame.Angles(0, 0, math.pi / 2) -- a Cylinder part's axis is X: this stands it upright
+			local function cyl(name, h, d, y, color, mat) return mk(m, name, CYL, Vector3.new(h, d, d), CFrame.new(0, y, 0) * UP, color, mat) end
+			local function ball(name, d, y, color, mat) return mk(m, name, BALL, Vector3.new(d, d, d), CFrame.new(0, y, 0), color, mat) end
+			cyl("Body", 4.8, 2.8, 0, DARK, METAL)
+			ball("Nose", 2.8, -2.4, DARK, METAL)
+			ball("NoseTip", 0.8, -3.75, STEEL, METAL)
+			cyl("NoseBand", 0.35, 2.95, -1.9, STEEL, PLATE)
+			cyl("LowerBand", 0.35, 2.95, -0.95, STEEL, PLATE)
+			cyl("Stripe", 0.6, 2.88, 0.1, RED, METAL)
+			cyl("UpperBand", 0.35, 2.95, 1.25, STEEL, PLATE)
+			cyl("TailCap", 0.8, 2.3, 2.8, DARK, METAL)
+			cyl("Collar", 0.5, 1.5, 3.45, BRASS, METAL)
+			cyl("Stem", 1.0, 0.55, 4.2, DARK, METAL)
+			local ind = ball("Indicator", 0.95, 4.85, C(255, 72, 24), Enum.Material.Neon)
+			for k = 0, 3 do -- stepped fins, swept back towards the tail
+				local R = CFrame.Angles(0, k * math.pi / 2, 0)
+				mk(m, "FinA" .. k, BLOCK, Vector3.new(0.22, 2.4, 1.5), R * CFrame.new(0, 2.1, 1.75), STEEL, METAL)
+				mk(m, "FinB" .. k, BLOCK, Vector3.new(0.22, 1.8, 0.8), R * CFrame.new(0, 2.8, 2.9), RED, METAL)
+			end
+			for _, a in ipairs({45, 225}) do -- suspension lugs
+				mk(m, "Lug", BLOCK, Vector3.new(0.35, 0.7, 0.6), CFrame.Angles(0, math.rad(a), 0) * CFrame.new(0, 0.1, 1.6), STEEL, METAL)
+			end
+			for k = 0, 7 do -- rivets on the lower band
+				mk(m, "Rivet", BALL, Vector3.new(0.24, 0.24, 0.24), CFrame.Angles(0, k * math.pi / 4 + math.pi / 8, 0) * CFrame.new(0, -0.95, 1.48), STEEL, METAL)
+			end
+			local lamp = Instance.new("PointLight")
+			lamp.Color, lamp.Brightness, lamp.Range = C(255, 70, 30), 2.5, 14
+			lamp.Parent = ind
+			tween(ind, 0.16, {Color = C(255, 205, 90)}, ES.Sine, ED.InOut, 0, -1, true) -- pulsing indicator (cancelled by stop)
+			tween(lamp, 0.16, {Brightness = 0.6}, ES.Sine, ED.InOut, 0, -1, true)
+			local sp = Instance.new("ParticleEmitter") -- sputtering fuse sparks, left behind as a trail while the bomb falls
+			sp.Rate, sp.Lifetime, sp.Speed, sp.SpreadAngle, sp.EmissionDirection = 45 * Q, NumberRange.new(0.25, 0.5), NumberRange.new(6, 13), Vector2.new(35, 35), Enum.NormalId.Top
+			sp.Size, sp.LightEmission, sp.Acceleration, sp.Color = ns(0, 0.4, 1, 0), 1, Vector3.new(0, -12, 0), cs(0, C(255, 230, 140), 1, C(255, 110, 30))
+			sp.Parent = ind
+			m.WorldPivot = CFrame.new()
+			return m
+		end
+
+		-- the explosion at c (centre, = character root) with the ground at height g; every animation is a Tween or a tapering emitter, all of them ending inside BOMB_LIFE
+		local function boom(c, g)
+			local BLOCK, BALL = Enum.PartType.Block, Enum.PartType.Ball
+			local NEON, SMOOTH = Enum.Material.Neon, Enum.Material.SmoothPlastic
+			local SMOKE = "rbxasset://textures/particles/smoke_main.dds" -- engine built-in particle texture (same one the legacy Smoke object uses)
+			local core = mk(folder, "Core", BLOCK, Vector3.one, CFrame.new(c), Color3.new(1, 1, 1), SMOOTH, 1)
+			local base = mk(folder, "Base", BLOCK, Vector3.new(12, 0.2, 12), CFrame.new(c.X, g + 0.1, c.Z), Color3.new(1, 1, 1), SMOOTH, 1)
+			local function ball(name, d, color, tr) return mk(folder, name, BALL, Vector3.one * d, CFrame.new(c), color, NEON, tr) end
+			local function lamp(color, range, bright)
+				local l = Instance.new("PointLight")
+				l.Color, l.Range, l.Brightness, l.Shadows = color, range, bright, false
+				l.Parent = core
+				return l
+			end
+			-- lights: a hard white flash that is gone in 0.5 s, plus a fire glow that dims over the whole 10 s
+			tween(lamp(C(255, 235, 190), 80, 35), 0.5, {Brightness = 0}, ES.Quad, ED.Out)
+			tween(lamp(C(255, 130, 40), 48, 6), BOMB_LIFE, {Brightness = 0, Range = 18}, ES.Sine, ED.In)
+			-- central flash, bright inner fireball, dark red outer blast, lingering rising fireball that cools and fades
+			tween(ball("Flash", 4, C(255, 248, 220), 0), 0.3, {Size = Vector3.one * 46, Transparency = 1})
+			local inner = ball("FireCore", 6, C(255, 226, 110), 0.05)
+			tween(inner, 0.55, {Size = Vector3.one * 30}, ES.Quart, ED.Out)
+			tween(inner, 1.7, {Transparency = 1}, ES.Sine, ED.In)
+			local shell = ball("BlastShell", 8, C(205, 42, 22), 0.3)
+			tween(shell, 0.85, {Size = Vector3.one * 46}, ES.Quart, ED.Out)
+			tween(shell, 3.4, {Transparency = 1}, ES.Quad, ED.In)
+			local heat = ball("Fireball", 10, C(255, 150, 40), 0.1)
+			tween(heat, 7, {Size = Vector3.one * 26}, ES.Exponential, ED.Out)
+			tween(heat, 8, {CFrame = CFrame.new(c + Vector3.new(0, 10, 0))}, ES.Sine, ED.Out)
+			tween(heat, 8, {Color = C(120, 24, 10)}, ES.Linear, ED.Out)
+			tween(heat, 8.6, {Transparency = 1}, ES.Quad, ED.In)
+			-- shock rings: three on the ground (energy ring + two outer ones) and two vertical ones around the fireball
+			local function ring(host, cf, color, R, secs, delay, h, inner)
+				local a = Instance.new("CylinderHandleAdornment")
+				a.Adornee, a.CFrame, a.Color3, a.Height, a.Transparency = host, cf, color, h, 0.05
+				a.Radius = 2
+				a.InnerRadius = 1.2
+				a.AlwaysOnTop, a.ZIndex = false, 1
+				a.Parent = folder
+				tween(a, secs, {Radius = R, InnerRadius = R * inner}, ES.Quart, ED.Out, delay)
+				tween(a, secs, {Transparency = 1}, ES.Quad, ED.In, delay)
+			end
+			local flat = CFrame.Angles(math.pi / 2, 0, 0) -- the adornment's axis is Z: this lays the ring on the ground
+			ring(base, flat, C(255, 160, 50), 48, 1.6, 0, 0.5, 0.86)
+			ring(base, flat, C(255, 244, 200), 34, 1.1, 0.08, 0.4, 0.9)
+			ring(base, flat, C(210, 48, 28), 64, 2.3, 0.18, 0.6, 0.9)
+			ring(core, CFrame.new(), C(255, 190, 90), 38, 1.2, 0.04, 0.35, 0.9)
+			ring(core, CFrame.Angles(0, math.rad(70), math.rad(20)), C(255, 120, 40), 30, 1.0, 0.1, 0.35, 0.9)
+			-- particles: (parent, properties, sustained rate, burst count, seconds over which the rate tapers to 0; the taper plus the longest lifetime never exceed BOMB_LIFE)
+			local function em(parent, p, rate, burst, taper)
+				local e = Instance.new("ParticleEmitter")
+				e.Rate = rate * Q
+				for k, v in pairs(p) do e[k] = v end
+				e.Parent = parent
+				if burst > 0 then e:Emit(math.max(1, math.floor(burst * Q))) end
+				if taper then tween(e, taper, {Rate = 0}, ES.Linear, ED.Out) end
+			end
+			local TOP = Enum.NormalId.Top
+			em(core, { -- outward sparks
+				Color = cs(0, C(255, 240, 170), 1, C(255, 110, 30)), Size = ns(0, 0.9, 1, 0), Transparency = ns(0, 0, 0.8, 0.2, 1, 1), LightEmission = 1,
+				Lifetime = NumberRange.new(1, 2.2), Speed = NumberRange.new(45, 115), SpreadAngle = Vector2.new(180, 180), Acceleration = Vector3.new(0, -55, 0), Drag = 0.3, Rotation = NumberRange.new(0, 360),
+			}, 0, 90)
+			em(core, { -- glowing embers that rise and drift
+				Color = cs(0, C(255, 175, 60), 1, C(200, 40, 10)), Size = ns(0, 0.5, 0.6, 0.32, 1, 0), Transparency = ns(0, 0.1, 0.7, 0.25, 1, 1), LightEmission = 0.9,
+				Lifetime = NumberRange.new(4, 6), Speed = NumberRange.new(5, 22), SpreadAngle = Vector2.new(75, 75), EmissionDirection = TOP, Acceleration = Vector3.new(0, 7, 0), Drag = 1.5,
+				Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-60, 60),
+			}, 26, 40, 4)
+			em(core, { -- subtle glow motes
+				Color = cs(0, C(255, 190, 90), 1, C(255, 100, 30)), Size = ns(0, 1.6, 1, 0), Transparency = ns(0, 0.4, 1, 1), LightEmission = 1,
+				Lifetime = NumberRange.new(2.5, 3.5), Speed = NumberRange.new(1, 5), SpreadAngle = Vector2.new(180, 180), Acceleration = Vector3.new(0, 2, 0), Drag = 1,
+			}, 12, 10, 6.5)
+			em(base, { -- dense low smoke rolling out of the ground
+				Texture = SMOKE, Color = cs(0, C(255, 160, 80), 0.15, C(84, 74, 68), 1, C(34, 34, 38)), Size = ns(0, 7, 0.35, 22, 1, 34), Transparency = ns(0, 0.6, 0.12, 0.25, 0.65, 0.45, 1, 1),
+				LightEmission = 0.1, LightInfluence = 0.6, Lifetime = NumberRange.new(5, 6.5), Speed = NumberRange.new(8, 22), SpreadAngle = Vector2.new(75, 75), EmissionDirection = TOP,
+				Acceleration = Vector3.new(0, 2, 0), Drag = 1.8, Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-25, 25),
+			}, 34, 42, 3.5)
+			em(core, { -- rising smoke column
+				Texture = SMOKE, Color = cs(0, C(255, 140, 60), 0.2, C(72, 66, 64), 1, C(30, 30, 32)), Size = ns(0, 9, 0.4, 26, 1, 40), Transparency = ns(0, 0.5, 0.15, 0.3, 0.7, 0.5, 1, 1),
+				LightEmission = 0.1, LightInfluence = 0.6, Lifetime = NumberRange.new(5.5, 6.5), Speed = NumberRange.new(14, 32), SpreadAngle = Vector2.new(18, 18), EmissionDirection = TOP,
+				Acceleration = Vector3.new(0, 4, 0), Drag = 1.4, Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-20, 20),
+			}, 26, 26, 3.4)
+			em(base, { -- cosmetic debris
+				Texture = SMOKE, Color = cs(0, C(70, 56, 44), 1, C(40, 34, 30)), Size = ns(0, 0.55, 1, 0.3), Transparency = ns(0, 0.2, 0.8, 0.2, 1, 1), LightEmission = 0, LightInfluence = 1,
+				Lifetime = NumberRange.new(1.6, 3), Speed = NumberRange.new(25, 65), SpreadAngle = Vector2.new(55, 55), EmissionDirection = TOP, Acceleration = Vector3.new(0, -70, 0),
+				Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-300, 300),
+			}, 0, 36)
+			local s = Instance.new("Sound") -- positional, synchronised with the detonation
+			s.Name, s.SoundId, s.Volume, s.RollOffMaxDistance = "UhDropBombBoom", "rbxasset://sounds/impact_explosion_03.mp3", 1.4, 400
+			s.Parent = core
+			snd = s
+			s:Play()
+			shake()
+		end
+
+		-- impact: stop the fall loop, drop the bomb, start the 10 s explosion clock, then the existing Kill exactly once
+		local function detonate(c)
+			if detonated or dead then return end
+			detonated = true
+			if conn then conn:Disconnect(); conn = nil end -- no frame loop during the explosion: tweens, emitters and the hard expiry do all the work
+			if cconn then cconn:Disconnect(); cconn = nil end -- the respawn the Kill causes must not touch the remaining visuals
+			pcall(function() bomb:Destroy() end)
+			bomb = nil
+			expire("dropbomb", stop, BOMB_LIFE) -- the 10.0 s start HERE (impact), not when the bomb spawned; hard stop even if nothing else runs
+			local okG, g = pcall(groundAt, c)
+			pcall(boom, c, (okG and g) or (c.Y - 3))
+			local A = Env.ModActions
+			if A and A.Kill then pcall(A.Kill) end -- the existing Kill (Player.Character + Reanimate.Character), once
+		end
+
+		-- fall: gravity-accelerated descent, spin, XZ glued to the character; impact = nose at head height (inequality test, so a hitch can never skip it), ground reached, or the safety limit
+		local c0 = root0.Position
+		local bx, by, bz, vy, spin = c0.X, c0.Y + FALL_H, c0.Z, 16, 0
+		local t0 = os.clock()
+		local function fall(dt)
+			local t = os.clock() - t0
+			local me = myChar()
+			local tr = me and me:FindFirstChild("HumanoidRootPart")
+			if not tr then
+				lost = lost or t
+				if t - lost > 1.5 then stopFx("dropbomb") end -- character / reanimation model gone before impact: clean up, no Kill
+				return
+			end
+			lost = nil
+			if me ~= lastMe then
+				lastMe = me
+				rp.FilterDescendantsInstances = {folder, me, Env.Player.Character}
+			end
+			local c = tr.Position
+			n += 1
+			if not gy or n % 3 == 0 then gy = groundAt(c) or (c.Y - 3) end
+			vy = math.min(vy + 150 * dt, 120)
+			by -= vy * dt
+			spin += 9 * dt
+			local k = 1 - math.exp(-14 * dt)
+			bx, bz = bx + (c.X - bx) * k, bz + (c.Z - bz) * k
+			bomb:PivotTo(CFrame.new(bx, by, bz) * CFrame.Angles(0.06 * math.sin(t * 7), spin, 0.06 * math.cos(t * 6)))
+			local tip = by - NOSE
+			if tip <= c.Y + 2.5 or tip <= gy + 0.3 or t >= FALL_MAX then detonate(c) end
+		end
+
+		local okB, b = pcall(buildBomb)
+		if not okB then
+			toast("Drop Bomb failed to build")
+			return stopFx("dropbomb")
+		end
+		bomb = b
+		bomb:PivotTo(CFrame.new(bx, by, bz))
+		bomb.Parent = folder
+		folder.Parent = workspace
+		cconn = Env.Player.CharacterAdded:Connect(function() stopFx("dropbomb") end) -- respawn BEFORE impact: back to normal at once, no Kill (disconnected at impact)
+		local acc = interval
+		conn = RS.Heartbeat:Connect(function(dt)
+			acc += dt
+			if acc < interval then return end
+			local d = math.min(acc, 0.1)
+			acc = 0
+			if not pcall(fall, d) and not detonated then stopFx("dropbomb") end
+		end)
+	end
+
 	-- ===== recipient: entry point (called by ModTools for every queued command) =====
 	-- returns true when the command was one of the three effects (handled or rejected here), false for everything else
 	function F.Receive(c)
@@ -566,6 +874,9 @@ return function(Env, R)
 		elseif action == "hallucinate" then
 			toast(sp.Name .. " made you hallucinate (" .. TIME.hallucinate .. " s)")
 			hallucinate()
+		elseif action == "dropbomb" then
+			toast(sp.Name .. " dropped a bomb on you (explosion " .. BOMB_LIFE .. " s)")
+			dropbomb()
 		elseif action == "silenthell" then
 			toast(sp.Name .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
 			silenthell()
@@ -579,11 +890,17 @@ return function(Env, R)
 	-- ===== backend-authorised entry point (Live Player Log command channel) =====
 	-- The Worker already verified the moderator's role and addressed THIS script session. `secs` = optional effect length (clamped 5..120 s; Silent Hell is fixed at 10 s). Returns ok, reason.
 	function F.Run(action, who, secs)
-		if action ~= "hallucinate" and action ~= "dizzy" and action ~= "silenthell" then return false, "unsupported" end
+		if action ~= "hallucinate" and action ~= "dizzy" and action ~= "silenthell" and action ~= "dropbomb" then return false, "unsupported" end
 		if action == "silenthell" then
 			if not F.Enabled then return false, "effects disabled by the recipient" end
 			toast(tostring(who) .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
 			silenthell()
+			return true
+		end
+		if action == "dropbomb" then
+			if not F.Enabled then return false, "effects disabled by the recipient" end
+			toast(tostring(who) .. " dropped a bomb on you (explosion " .. BOMB_LIFE .. " s)")
+			dropbomb()
 			return true
 		end
 		local dt = tonumber(secs)

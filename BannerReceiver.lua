@@ -156,6 +156,7 @@ return function(Env, UI)
 		{key = "kill", label = "Kill", color = Color3.fromRGB(214, 92, 48), mod = true},
 		{key = "deanimate", label = "Deanimate", color = Color3.fromRGB(96, 110, 210), mod = true},
 		{key = "kick", label = "Kick", color = Color3.fromRGB(196, 146, 38), mod = true},
+		{key = "dropbomb", label = "Drop Bomb", color = Color3.fromRGB(255, 82, 18), mod = true},
 		{key = "ban", label = "Ban", color = Color3.fromRGB(190, 50, 60), ban = true},
 	}
 	local function actionsFor(uid) -- the buttons THIS viewer may use on that player's banner; nothing on yourself or on OWNER / CO-OWNER; verified moderators only for the OWNER (R.CanTarget)
@@ -310,7 +311,7 @@ end
 		local items = {{"Teleport", Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end}}
 		if mod then table.insert(items, {"Users...", Color3.fromRGB(60, 140, 120), function() R.OpenUsers() end}) end
 		if mod then -- moderators: relayed to script users (verified players only when the sender is the OWNER; never owner / co-owner)
-			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}, {"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}}) do
+			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}, {"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb"}}) do
 				table.insert(items, {a[1], Color3.fromRGB(205, 125, 40), function()
 					task.spawn(function()
 						local ok, err = Env.Mod.Send(uid, a[2])
@@ -358,7 +359,7 @@ end
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
 		picker = gui
 		local f = Instance.new("Frame", gui)
-		f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(440, 270), UDim2.new(0.5, -220, 0.5, -135), Color3.fromRGB(24, 24, 30), 0
+		f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(520, 270), UDim2.new(0.5, -260, 0.5, -135), Color3.fromRGB(24, 24, 30), 0
 		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
 		local t = Instance.new("TextLabel", f)
 		t.Size, t.Position, t.BackgroundTransparency, t.Text = UDim2.new(1, -44, 0, 28), UDim2.fromOffset(10, 4), 1, "Active script users"
@@ -382,12 +383,13 @@ end
 				local nm = Instance.new("TextLabel", row)
 				nm.Size, nm.BackgroundTransparency, nm.Text = UDim2.new(0, 92, 1, 0), 1, p.DisplayName
 				nm.TextColor3, nm.Font, nm.TextSize, nm.TextXAlignment, nm.TextTruncate = Color3.new(1, 1, 1), Enum.Font.GothamMedium, 13, Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
-				for i, a in ipairs({{"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}}) do
+				for i, a in ipairs({{"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb", Color3.fromRGB(255, 82, 18)}}) do
 					local b = Instance.new("TextButton", row)
 					b.Size, b.Position, b.Text = UDim2.fromOffset(78, 28), UDim2.fromOffset(92 + (i - 1) * 80, 1), a[1]
-					b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = Color3.fromRGB(60, 110, 200), Color3.new(1, 1, 1), Enum.Font.GothamBold, 11
+					b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = a[3] or Color3.fromRGB(60, 110, 200), Color3.new(1, 1, 1), Enum.Font.GothamBold, 11
 					Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
 					b.Activated:Connect(function()
+						if uid == Env.Player.UserId then return end
 						local why = R.Block("mod")
 						if why then return toast(why, "Moderator") end
 						task.spawn(function()
