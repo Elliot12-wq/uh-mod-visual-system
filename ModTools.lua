@@ -46,7 +46,7 @@ return function(Env, R)
 
 	-- Bring Users / Hallucinate Users / Dizzy live in VerifiedPlayerFeatures.lua (Env.Fx): one gate for owner / co-owner / verified players, recipient is notified,
 	-- self-cleaning timed effects. Send / handle below only route to it.
-	local FXA = {bring = true, hallucinate = true, dizzy = true}
+	local FXA = {bring = true, hallucinate = true, dizzy = true, silenthell = true}
 	function M.CanFx() return Env.Fx ~= nil and Env.Fx.CanUse() end
 
 	local function toast(msg)

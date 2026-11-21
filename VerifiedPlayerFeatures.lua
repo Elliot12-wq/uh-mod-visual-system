@@ -1,4 +1,4 @@
--- VerifiedPlayerFeatures.lua | Bring Users / Hallucinate Users / Dizzy
+-- VerifiedPlayerFeatures.lua | Bring Users / Hallucinate Users / Dizzy / Silent Hell (10 s, recipient-side, ends with the existing Kill)
 -- ONE permission gate for all three features: OWNER, CO-OWNER and VERIFIED players have identical access. Roles come from roles.json + whitelist.json through
 -- BannerReceiver.RoleOf (nothing hardcoded); anyone else gets no controls and cannot send.
 -- Targets: only OTHER script users with a live banner (R.Banners), never owner / co-owner / verified. The target is always notified (toast), no prompt.
@@ -10,9 +10,10 @@ return function(Env, R)
 	local Players, RS, HS = Env.Players, Env.RunService, Env.HttpService
 	local genv = (getgenv and getgenv()) or _G
 	local F = {Enabled = genv.UhFxEnabled ~= false}
-	local ACT = {bring = true, hallucinate = true, dizzy = true}
-	local TIME = {hallucinate = 60, dizzy = 20}
-	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}}
+	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true}
+	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10}
+	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10} -- default effect lengths (TIME may be overridden per command by F.Run)
+	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}}
 	F.Time = TIME
 
 	-- ===== permissions: the single gate =====
@@ -352,6 +353,197 @@ return function(Env, R)
 		end)
 	end
 
+	-- ===== Silent Hell =====
+	-- 10 s sequence that runs ONLY on this client: smooth dark-red colour grade (a ColorCorrectionEffect under the camera - Lighting is never touched), the bundled "Who Will Know (24 Bigslow)" track
+	-- (Env.SilentHellSong() = Util.Intro15Song, played from 0:00 at low volume), ten black silhouettes creeping in from different directions while movement is frozen (Humanoid values of the real AND the
+	-- reanimated character + the PlayerModule controls; nothing is anchored, destroyed or disconnected), then the existing Env.ModActions.Kill exactly once.
+	-- ONE stop function cleans up every exit (completion, re-trigger, respawn, FX disabled, unload, lost character); only normal completion kills.
+	local function silenthell()
+		stopFx("silenthell")
+		if not F.Enabled then return end
+		local cam = workspace.CurrentCamera
+		local me0 = myChar()
+		local root0 = me0 and me0:FindFirstChild("HumanoidRootPart")
+		if not (cam and root0) then return toast("Silent Hell unavailable: no character") end
+		local TS, SND = Env.TweenService or game:GetService("TweenService"), game:GetService("SoundService")
+		local T = TIME.silenthell
+		local OUTRO, STEPS, VOL = 0.8, 7, 0.14 -- figures finish converging when the last 0.8 s (final impact) start
+		local TC = T - OUTRO
+		local okL, low = pcall(function() return Env.IsLowEnd and Env.IsLowEnd() end)
+		local interval = (okL and low) and 1 / 20 or 0
+		local hum0 = me0:FindFirstChildOfClass("Humanoid")
+		local lift = math.max(((hum0 and hum0.HipHeight) or 2) + root0.Size.Y / 2, 3)
+		local c0 = root0.Position
+		local folder = Instance.new("Folder")
+		folder.Name = "UhSilentHell"
+		local figs = {}
+		for i = 1, 10 do -- six anchored, non-colliding black parts each (no Humanoid, no scripts, nothing replicated)
+			local s = (lift / 3) * (0.9 + math.random() * 0.25)
+			local m, ps = Instance.new("Model"), {}
+			m.Name = "F" .. i
+			local function part(name, size, off, ball)
+				local p = Instance.new("Part")
+				p.Name, p.Size, p.Color, p.Material = name, size * s, Color3.new(0, 0, 0), Enum.Material.SmoothPlastic
+				p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.CastShadow, p.Massless = true, false, false, false, false, true
+				p.TopSurface, p.BottomSurface, p.Transparency = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth, 1
+				if ball then p.Shape = Enum.PartType.Ball end
+				p.CFrame = CFrame.new(off * s)
+				p.Parent = m
+				ps[#ps + 1] = p
+				return p
+			end
+			m.PrimaryPart = part("Torso", Vector3.new(2, 2, 1), Vector3.zero)
+			part("Head", Vector3.new(1.2, 1.2, 1.2), Vector3.new(0, 1.6, 0), true)
+			part("LArm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 0, 0))
+			part("RArm", Vector3.new(1, 2, 1), Vector3.new(1.5, 0, 0))
+			part("LLeg", Vector3.new(1, 2, 1), Vector3.new(-0.5, -2, 0))
+			part("RLeg", Vector3.new(1, 2, 1), Vector3.new(0.5, -2, 0))
+			m.Parent = folder
+			figs[i] = {m = m, p = ps, s = s, a = (i - 1) / 10 * math.pi * 2 + (math.random() - 0.5) * 0.4, r0 = 20 + math.random() * 9, r1 = 3 + (i % 2) * 1.2,
+				d = math.random() * 1.2, ph = math.random() * 6.28, lean = (math.random() - 0.5) * 0.3, fade = -1, gy = c0.Y - lift, gyT = c0.Y - lift}
+		end
+
+		local t0 = os.clock()
+		local dead, outro, lost, lastMe, n = false, false, nil, nil, 0
+		local tw, frozen, snd, ctl, ctlOff, conn, cconn = {}, {}, nil, nil, false, nil, nil
+		local rp = RaycastParams.new()
+		rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+		local cc = Instance.new("ColorCorrectionEffect")
+		cc.Name = "UhSilentHellTint"
+
+		local function tween(o, secs, props)
+			pcall(function()
+				local x = TS:Create(o, TweenInfo.new(secs, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), props)
+				tw[#tw + 1] = x
+				x:Play()
+			end)
+		end
+		local function hold(h) -- freeze one Humanoid; a value somebody else sets meanwhile becomes the one restored
+			local r = frozen[h]
+			if not r then
+				r = {ws = h.WalkSpeed, jp = h.JumpPower, jh = h.JumpHeight, up = h.UseJumpPower}
+				frozen[h] = r
+			end
+			if h.WalkSpeed ~= 0 then r.ws = h.WalkSpeed; h.WalkSpeed = 0 end
+			if h.JumpPower ~= 0 then r.jp = h.JumpPower; h.JumpPower = 0 end
+			if h.JumpHeight ~= 0 then r.jh = h.JumpHeight; h.JumpHeight = 0 end
+		end
+		local function stop() -- the ONE cleanup
+			dead = true
+			if conn then conn:Disconnect(); conn = nil end
+			if cconn then cconn:Disconnect(); cconn = nil end
+			for _, x in ipairs(tw) do pcall(function() x:Cancel() end) end
+			table.clear(tw)
+			if snd then pcall(function() snd:Stop(); snd:Destroy() end); snd = nil end
+			pcall(function() cc:Destroy() end)
+			pcall(function() folder:Destroy() end)
+			for h, r in pairs(frozen) do
+				pcall(function()
+					if h.Parent then
+						h.WalkSpeed, h.JumpPower, h.JumpHeight = r.ws, r.jp, r.jh
+						h.UseJumpPower = r.up
+					end
+				end)
+			end
+			table.clear(frozen)
+			if ctl and ctlOff then pcall(function() ctl:Enable(true) end); ctlOff = false end
+		end
+		fx.silenthell = stop
+		local function complete() -- normal end only: clean up, then the existing Kill (Player.Character + Reanimate.Character), once
+			if fx.silenthell ~= stop then return end
+			stopFx("silenthell")
+			local A = Env.ModActions
+			if A and A.Kill then pcall(A.Kill) end
+		end
+
+		local function step()
+			local t = os.clock() - t0
+			if t >= T then return complete() end
+			local cur = workspace.CurrentCamera
+			if cur and cur ~= cam then cam = cur; cc.Parent = cam; folder.Parent = cam end
+			local me = myChar()
+			local tr = me and me:FindFirstChild("HumanoidRootPart")
+			if not tr then
+				lost = lost or t
+				if t - lost > 1.5 then stopFx("silenthell") end -- character / reanimation model gone: clean up, no Kill
+				return
+			end
+			lost = nil
+			for _, ch in ipairs({Env.Player.Character or false, me}) do -- real character AND the active reanimated one
+				local h = ch and ch:FindFirstChildOfClass("Humanoid")
+				if h then hold(h) end
+			end
+			if me ~= lastMe then
+				lastMe = me
+				rp.FilterDescendantsInstances = {folder, me, Env.Player.Character}
+			end
+			if not outro and t >= TC then -- final impact: the grade goes black-red, the song fades out
+				outro = true
+				tween(cc, OUTRO, {Brightness = -0.6, Contrast = 0.55, TintColor = Color3.fromRGB(190, 20, 20)})
+				if snd then tween(snd, OUTRO, {Volume = 0}) end
+			end
+			n += 1
+			local c = tr.Position
+			local gy0 = c.Y - lift
+			for i, f in ipairs(figs) do
+				local u = math.clamp((t - f.d) / (TC - f.d), 0, 1)
+				local x = u * STEPS -- creep: STEPS short lunges with a pause after each, finishing exactly at u = 1
+				local k = math.floor(x)
+				local fr = math.clamp((x - k) / 0.6, 0, 1)
+				local g = (k + fr * fr * (3 - 2 * fr)) / STEPS
+				local r = f.r1 + (f.r0 - f.r1) * (1 - g)
+				local a = f.a + 0.35 * u
+				local px, pz = c.X + math.cos(a) * r, c.Z + math.sin(a) * r
+				if n % 6 == i % 6 then
+					local hit = workspace:Raycast(Vector3.new(px, c.Y + 6, pz), Vector3.new(0, -40, 0), rp)
+					f.gyT = hit and hit.Position.Y or gy0
+				end
+				f.gy = f.gy + (f.gyT - f.gy) * 0.3
+				local pos = Vector3.new(px, f.gy + 3 * f.s + 0.06 * f.s * math.sin(t * 2 + f.ph), pz)
+				f.m:PivotTo(CFrame.lookAt(pos, Vector3.new(c.X, pos.Y, c.Z)) * CFrame.Angles(f.lean, 0, math.rad(3) * math.sin(t * 1.6 + f.ph)))
+				local fade = math.clamp((t - f.d) / 1.6, 0, 1)
+				if fade ~= f.fade then
+					f.fade = fade
+					for _, p in ipairs(f.p) do p.Transparency = 1 - fade end
+				end
+			end
+		end
+
+		cc.Parent = cam
+		tween(cc, 1.4, {TintColor = Color3.fromRGB(255, 80, 70), Saturation = -0.25, Contrast = 0.25, Brightness = -0.1}) -- smooth fade into the red atmosphere
+		pcall(function() -- no walking / jumping input (the Humanoid values are held every step as well)
+			local ps = Env.Player:FindFirstChild("PlayerScripts")
+			local pm = ps and ps:FindFirstChild("PlayerModule")
+			local c = pm and require(pm):GetControls()
+			if c and c.controlsEnabled ~= false then c:Disable(); ctl, ctlOff = c, true end
+		end)
+		cconn = Env.Player.CharacterAdded:Connect(function() stopFx("silenthell") end) -- respawn: back to normal at once, no Kill
+		task.delay(T, complete) -- hard stop even if the frame loop stalls
+		if not pcall(step) then return stopFx("silenthell") end
+		folder.Parent = cam
+		task.spawn(function() -- the supplied track from the existing bundled asset (written to the asset folder once), local to this client
+			local S = Env.SilentHellSong and Env.SilentHellSong()
+			if not S then return end
+			local okE, ready = pcall(S.Ensure, 60)
+			if dead or not (okE and ready) or os.clock() - t0 > T - 1.5 then return end
+			local okA, id = pcall(getcustomasset, S.Path)
+			if dead or not okA or type(id) ~= "string" or id == "" then return end
+			local sn = Instance.new("Sound")
+			sn.Name, sn.SoundId, sn.Volume, sn.Looped, sn.TimePosition = "UhSilentHellSong", id, 0, false, 0
+			sn.Parent = SND
+			snd = sn
+			sn:Play()
+			tween(sn, 1.5, {Volume = VOL})
+		end)
+		local acc = interval
+		conn = RS.Heartbeat:Connect(function(dt)
+			acc += dt
+			if acc < interval then return end
+			acc = 0
+			if not pcall(step) then stopFx("silenthell") end
+		end)
+	end
+
 	-- ===== recipient: entry point (called by ModTools for every queued command) =====
 	-- returns true when the command was one of the three effects (handled or rejected here), false for everything else
 	function F.Receive(c)
@@ -367,10 +559,30 @@ return function(Env, R)
 		elseif action == "hallucinate" then
 			toast(sp.Name .. " made you hallucinate (" .. TIME.hallucinate .. " s)")
 			hallucinate()
+		elseif action == "silenthell" then
+			toast(sp.Name .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
+			silenthell()
 		else
 			toast(sp.Name .. " made you dizzy (" .. TIME.dizzy .. " s)")
 			dizzy()
 		end
+		return true
+	end
+
+	-- ===== backend-authorised entry point (Live Player Log command channel) =====
+	-- The Worker already verified the moderator's role and addressed THIS script session. `secs` = optional effect length (clamped 5..120 s; Silent Hell is fixed at 10 s). Returns ok, reason.
+	function F.Run(action, who, secs)
+		if action ~= "hallucinate" and action ~= "dizzy" and action ~= "silenthell" then return false, "unsupported" end
+		if action == "silenthell" then
+			if not F.Enabled then return false, "effects disabled by the recipient" end
+			toast(tostring(who) .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
+			silenthell()
+			return true
+		end
+		local dt = tonumber(secs)
+		TIME[action] = dt and math.clamp(math.floor(dt), 5, 120) or DEFT[action]
+		toast(tostring(who) .. " made you " .. (action == "dizzy" and "dizzy" or "hallucinate") .. " (" .. TIME[action] .. " s)")
+		if action == "hallucinate" then hallucinate() else dizzy() end
 		return true
 	end
 
