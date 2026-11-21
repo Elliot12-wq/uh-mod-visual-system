@@ -1498,7 +1498,19 @@ return function(Env, R)
 	-- ===== backend-authorised entry point (Live Player Log command channel) =====
 	-- The Worker already verified the moderator's role and addressed THIS script session. `secs` = optional effect length (clamped 5..120 s; Silent Hell is fixed at 10 s). Returns ok, reason.
 	function F.Run(action, who, secs)
-		if action ~= "hallucinate" and action ~= "dizzy" and action ~= "silenthell" and action ~= "dropbomb" then return false, "unsupported" end
+		if action ~= "hallucinate" and action ~= "dizzy" and action ~= "silenthell" and action ~= "dropbomb" and action ~= "domain" and action ~= "cooked" then return false, "unsupported" end
+		if action == "domain" then
+			if not F.Enabled then return false, "effects disabled by the recipient" end
+			toast(tostring(who) .. " activated Domain Expansion: Unlimited Void on you (" .. TIME.domain .. " s)")
+			domain()
+			return true
+		end
+		if action == "cooked" then
+			if not F.Enabled then return false, "effects disabled by the recipient" end
+			toast(tostring(who) .. " called a SWAT squad on you (" .. TIME.cooked .. " s)")
+			cooked()
+			return true
+		end
 		if action == "silenthell" then
 			if not F.Enabled then return false, "effects disabled by the recipient" end
 			toast(tostring(who) .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
