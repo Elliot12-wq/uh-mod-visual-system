@@ -187,15 +187,21 @@ return function(Env, UI)
 	local function sig(o) return o.title .. "|" .. o.subtitle .. "|" .. o.image .. "|" .. (o.role and (o.role.tag or "v") or "") .. "|" .. o.actKey end
 
 	local function targetPart(uid)
-		local char
+		local char, part
 		if uid == Env.Player.UserId then
 			char = Env.GetLocalCharacter() -- reanimated character when active, real one otherwise
 		else
 			local p = Players:GetPlayerByUserId(uid)
-			char = p and p.Character
+			if p and Env.ActiveBody then
+				local head, root
+				char, head, root = Env.ActiveBody(p) -- the visible reanimated body, not the reset real character
+				part = head or root
+			else
+				char = p and p.Character
+			end
 		end
 		if not char or not char.Parent then return nil end
-		local part = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+		part = part or char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
 		if part and part:IsA("BasePart") and part.Parent then return part end
 	end
 	local function remove(uid)
@@ -263,7 +269,13 @@ end
 	function R.Teleport(uid) -- stand 4 studs in front of the player, facing them
 		if os.clock() - (R.LastTP or 0) < 0.6 then return end
 		local p = Players:GetPlayerByUserId(uid)
-		local tr = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		local tr
+		if p and Env.ActiveBody then
+			local _, head, root = Env.ActiveBody(p) -- visible reanimated body: the real HumanoidRootPart is parked in the void while they reanimate
+			tr = root or head
+		else
+			tr = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		end
 		local me = Env.GetLocalCharacter() -- reanimated character when active
 		if not (tr and me and me.Parent) then return end
 		R.LastTP = os.clock()
@@ -455,12 +467,13 @@ end
 			end
 		end)
 		table.insert(conns, RS.Heartbeat:Connect(function() -- re-anchor: a cached part is revalidated with Name + IsDescendantOf; the full lookup only runs for the local player (reanim start/stop) or a stale / unresolved part (respawn)
-			local hidden, me = R.Hidden, Env.Player.UserId
+			local hidden, me, now = R.Hidden, Env.Player.UserId, os.clock()
 			for uid, e in pairs(R.Banners) do
 				local part = e.Part
 				if hidden then
 					part = nil
-				elseif uid == me or not part or part.Name ~= "Head" or not part:IsDescendantOf(workspace) then
+				elseif uid == me or not part or part.Name ~= "Head" or not part:IsDescendantOf(workspace) or now - (e.Chk or 0) > 0.5 then -- remote banners are re-resolved twice a second: a player may start / stop reanimating
+					e.Chk = now
 					part = targetPart(uid)
 				end
 				if part ~= e.Part then e.Part = part; e.UI:SetAdornee(part) end

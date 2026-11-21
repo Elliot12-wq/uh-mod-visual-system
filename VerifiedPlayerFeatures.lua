@@ -110,8 +110,15 @@ return function(Env, R)
 	end
 
 	local function bring(sp)
-		local sch = sp.Character
-		local sr = sch and sch:FindFirstChild("HumanoidRootPart")
+		local sch, sr
+		if Env.ActiveBody then
+			local sh
+			sch, sh, sr = Env.ActiveBody(sp) -- the moderator's visible reanimated body, never their reset real character
+			sr = sr or sh
+		else
+			sch = sp.Character
+			sr = sch and sch:FindFirstChild("HumanoidRootPart")
+		end
 		local me = myChar()
 		if not (sr and me and me.Parent) then return toast("Bring failed: " .. sp.Name .. " is not loaded for you") end
 		local root = me:FindFirstChild("HumanoidRootPart")
