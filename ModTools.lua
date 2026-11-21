@@ -1,32 +1,16 @@
--- ModTools.lua | moderator actions (kill / deanimate / kick) relayed to OTHER SCRIPT USERS who misuse the script.
--- Who may send: verified moderators + owner / co-owner (their userId must hold a key in the backend's MOD_KEYS).
--- Who can be hit: only players running this script, and never verified players / owner / co-owner. The target is always notified.
--- Env needs: Player, Players, HttpService, Request, Backend, Room, Token, ModKey (getgenv().UhBannerConfig.ModKey), ModActions {Kill, Deanimate, Kick(msg)}, Fx (VerifiedPlayerFeatures.lua: bring / hallucinate / dizzy)
+-- ModTools.lua | moderator actions (kill / deanimate / kick / bring / hallucinate / dizzy) relayed to OTHER SCRIPT USERS.
+-- Who may send: verified moderators (whitelist.json) + owner / co-owner, recognised by userId from roles.json on GitHub (no key).
+-- Who can be hit: only players running this script, never owner / co-owner; verified players only by the OWNER (roles.json "owner", R.CanTarget). The target is always notified.
+-- bring / hallucinate / dizzy: implemented in VerifiedPlayerFeatures.lua (Env.Fx): recipient is notified, no prompt, no cooldown, the temporary effects (hallucinate 60 s, dizzy 20 s) clean themselves up.
+-- Env needs: Player, Players, RunService, HttpService, Request, Backend, Room, Token, ModActions {Kill, Deanimate, Kick(msg)}, Fx (VerifiedPlayerFeatures.lua)
 return function(Env, R)
-	local HS, Players = Env.HttpService, Env.Players
+	local HS, Players, RS = Env.HttpService, Env.Players, Env.RunService
 	local M = {Running = false}
 	local ACTIONS = {kill = true, deanimate = true, kick = true}
+	local FXA = {bring = true, hallucinate = true, dizzy = true, silenthell = true} -- handled by Env.Fx (VerifiedPlayerFeatures.lua)
 
 	function M.CanModerate()
-		return Env.Request ~= nil and Env.ModKey ~= nil and Env.ModKey ~= "" and R.RoleOf(Env.Player.UserId) ~= nil
-	end
-
-	-- key box in the main UI: a whitelisted account redeems a one-time key; the first user to use a key locks it to their account.
-	-- returns ok, message, definitelyBad (true when the backend rejected the key itself)
-	function M.Redeem(key)
-		key = (tostring(key or ""):gsub("%s", ""))
-		if key == "" then return false, "enter your key first" end
-		if not R.IsWhitelisted(Env.Player.UserId) then return false, "this account is not on the verified whitelist" end
-		if not Env.Request then return false, "executor has no request()" end
-		local ok, res = pcall(Env.Request, {Url = Env.Backend .. "/verify", Method = "POST", Headers = {["Content-Type"] = "application/json"},
-			Body = HS:JSONEncode({userId = Env.Player.UserId, key = key})})
-		if not ok or type(res) ~= "table" then return false, "backend unreachable" end
-		if res.StatusCode == 403 then return false, "invalid key, or it was already used by someone else", true end
-		if res.StatusCode ~= 200 then return false, "HTTP " .. tostring(res.StatusCode) end
-		Env.ModKey = key
-		R.SetVerified(Env.Player.UserId) -- badge right away; the next banner poll confirms it for everyone
-		R.Poke()
-		return true
+		return Env.Request ~= nil and R.RoleOf(Env.Player.UserId) ~= nil -- owner / co-owner / verified players: no key (the backend recognises their userId)
 	end
 
 	function M.Send(target, action)
@@ -36,18 +20,13 @@ return function(Env, R)
 		end
 		if not ACTIONS[action] then return false, "bad action" end
 		if not M.CanModerate() then return false, "moderators only" end
-		if R.IsWhitelisted(target) then return false, "verified players are immune" end
+		if not R.CanTarget(target) then return false, R.IsWhitelisted(target) and "verified players are immune" or "bad target" end
 		local ok, res = pcall(Env.Request, {Url = Env.Backend .. "/mod", Method = "POST", Headers = {["Content-Type"] = "application/json"},
-			Body = HS:JSONEncode({room = Env.Room, userId = Env.Player.UserId, key = Env.ModKey, target = target, action = action})})
+			Body = HS:JSONEncode(Env.Sign("/mod", {room = Env.Room, userId = Env.Player.UserId, token = Env.Token, target = target, action = action}, tostring(target) .. ":" .. action))})
 		if not ok then return false, tostring(res) end
 		if type(res) ~= "table" or res.StatusCode ~= 200 then return false, "HTTP " .. tostring(type(res) == "table" and res.StatusCode) end
 		return true
 	end
-
-	-- Bring Users / Hallucinate Users / Dizzy live in VerifiedPlayerFeatures.lua (Env.Fx): one gate for owner / co-owner / verified players, recipient is notified,
-	-- self-cleaning timed effects. Send / handle below only route to it.
-	local FXA = {bring = true, hallucinate = true, dizzy = true, silenthell = true}
-	function M.CanFx() return Env.Fx ~= nil and Env.Fx.CanUse() end
 
 	local function toast(msg)
 		pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", {Title = "Moderator", Text = msg, Duration = 6}) end)
@@ -57,8 +36,7 @@ return function(Env, R)
 		if Env.Fx and Env.Fx.Receive(c) then return end -- bring / hallucinate / dizzy
 		if type(c) ~= "table" or not ACTIONS[c.action] then return end
 		local by = tonumber(c.by)
-		if not by or by == Env.Player.UserId or not R.RoleOf(by) then return end -- sender must be a verified moderator / owner / co-owner
-		if R.IsWhitelisted(Env.Player.UserId) then return end -- whitelisted / verified players, owner and co-owner are immune
+		if not R.CanBeModeratedBy(by) then return end -- sender must be a verified moderator / owner / co-owner; verified recipients accept ONLY an OWNER in this server, owner / co-owner recipients nobody
 		local p = Players:GetPlayerByUserId(by)
 		local name = p and p.Name or "a moderator"
 		local A = Env.ModActions or {}
@@ -78,18 +56,26 @@ return function(Env, R)
 		if M.Running or not Env.Request then return end
 		M.Running = true
 		task.spawn(function()
-			local fails = 0
-			while M.Running do
-				local ok, res = pcall(Env.Request, {Url = Env.Backend .. "/commands?room=" .. HS:UrlEncode(Env.Room) .. "&userId=" .. Env.Player.UserId .. "&token=" .. HS:UrlEncode(Env.Token), Method = "GET"})
-				if ok and type(res) == "table" and res.StatusCode == 200 then
-					fails = 0
-					local ok2, data = pcall(HS.JSONDecode, HS, res.Body)
-					if ok2 and type(data) == "table" and type(data.commands) == "table" then
-						for _, c in ipairs(data.commands) do pcall(handle, c) end
-					end
-				else fails += 1 end
-				task.wait(math.min(2 + fails * 2, 12))
-			end
+local fails, idle = 0, 0
+while M.Running do
+local ok, res = pcall(Env.Request, {Url = Env.Backend .. "/commands?room=" .. HS:UrlEncode(Env.Room) .. "&userId=" .. Env.Player.UserId .. "&token=" .. HS:UrlEncode(Env.Token), Method = "GET"})
+local wait
+if ok and type(res) == "table" and res.StatusCode == 200 then
+fails = 0
+local got = false
+local ok2, data = pcall(HS.JSONDecode, HS, res.Body)
+if ok2 and type(data) == "table" and type(data.commands) == "table" then
+for _, c in ipairs(data.commands) do got = true; pcall(handle, c) end
+end
+idle = got and 0 or math.min(idle + 1, 3)
+wait = 2 + idle -- 2s right after a command, stretching to 5s while nothing arrives
+else
+fails += 1
+wait = math.min(2 * 2 ^ fails, 30)
+if ok and type(res) == "table" and res.StatusCode == 429 then wait = math.max(wait, 20) end
+end
+task.wait(wait + math.random())
+end
 		end)
 	end
 

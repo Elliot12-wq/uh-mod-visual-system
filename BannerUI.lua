@@ -153,8 +153,9 @@ return function(Env)
 		local W = (role and role.tag) and 340 or 268
 		local self = setmetatable({Opts = o, Seed = math.random() * 10, Alive = true, Spark = {}, G = {glow = {}, shine = {}, spark = {}, ring = {}, depth = {}},
 			LastBG = os.clock(), Role = role, RoleColor = role and role.color, W = W, CurA = a, St = st0}, Banner)
-		-- inline action buttons: only ever on plain (unverified) banners; verified / owner / co-owner banners never get them
-		local acts = (not role and type(o.acts) == "table" and #o.acts > 0) and o.acts or nil
+		-- inline action buttons: drawn for whatever the receiver granted for THIS userId (o.acts is already permission-checked per target: plain banners, and verified
+		-- banners when the viewer is the OWNER). Width / positions below are derived from this banner's own W, so plain (268) and rank (340) cards both work.
+		local acts = (type(o.acts) == "table" and #o.acts > 0) and o.acts or nil
 		local extra = acts and 2 * (AX + math.min(#acts, ACOLS) * (AW + AG) + 4) or 0 -- the gui is centred on the card, so reserve the room on both sides
 		local gui = new("BillboardGui", {Name = "UhBanner_" .. tostring(o.userId), AlwaysOnTop = true, Size = UDim2.fromOffset(W + 10 + extra, 150),
 			StudsOffset = Vector3.new(0, 1.7, 0), MaxDistance = 150, LightInfluence = 0, ResetOnSpawn = false,
@@ -313,30 +314,50 @@ return function(Env)
 		end
 	end
 
-	function Banner:Contains(p) -- p = point in viewport coordinates
-		local cam, part = workspace.CurrentCamera, self.Gui.Adornee
-		if not (self.Alive and self.Shown and cam and part and self.Gui.Enabled) then return false end
-		if (cam.CFrame.Position - part.Position).Magnitude > self.Gui.MaxDistance then return false end
-		local v, on = cam:WorldToViewportPoint(part.Position + cam.CFrame.UpVector * self.Gui.StudsOffset.Y)
-		if not on then return false end
-		local s = self.Scale.Scale
-		return math.abs(p.X - v.X) <= self.W / 2 * s and p.Y >= v.Y - 78 * s and p.Y <= v.Y - 14 * s
-	end
-
-	function Banner:HitAction(p) -- p = point in viewport coordinates; returns the key of the inline button under p (or nil)
-		if not self.ActBtn then return nil end
+	function Banner:_screen() -- viewport position of THIS banner's gui centre + its UIScale (nil while it can't be hit: hidden / not on screen / too far)
 		local cam, part = workspace.CurrentCamera, self.Gui.Adornee
 		if not (self.Alive and self.Shown and cam and part and self.Gui.Enabled) then return nil end
 		if (cam.CFrame.Position - part.Position).Magnitude > self.Gui.MaxDistance then return nil end
 		local v, on = cam:WorldToViewportPoint(part.Position + cam.CFrame.UpVector * self.Gui.StudsOffset.Y)
 		if not on then return nil end
-		local s = self.Scale.Scale
+		return v, self.Scale.Scale
+	end
+
+	local function inCard(self, p, v, s)
+		return math.abs(p.X - v.X) <= self.W / 2 * s and p.Y >= v.Y - 78 * s and p.Y <= v.Y - 14 * s
+	end
+
+	local function inAction(self, b, p, v, s)
+		-- holder is anchored bottom-centre on the gui centre (v) and is 78 tall: its right edge is v.X + W/2, its top is v.Y - 78
+		local x0 = v.X + (self.W / 2 + AX + b.Col * (AW + AG)) * s
+		local y0 = v.Y + (AY + b.Row * (AH + AG) - 78) * s
+		return p.X >= x0 - 3 and p.X <= x0 + (AW + 3) * s and p.Y >= y0 - 3 and p.Y <= y0 + (AH + 3) * s
+	end
+
+	function Banner:Contains(p) -- p = point in viewport coordinates
+		local v, s = self:_screen()
+		return v ~= nil and inCard(self, p, v, s)
+	end
+
+	function Banner:HitAction(p) -- p = point in viewport coordinates; returns the key of the inline button under p (or nil)
+		if not self.ActBtn then return nil end
+		local v, s = self:_screen()
+		if not v then return nil end
 		for key, b in pairs(self.ActBtn) do
-			-- holder is anchored bottom-centre on the gui centre (v) and is 78 tall: its right edge is v.X + W/2, its top is v.Y - 78
-			local x0 = v.X + (self.W / 2 + AX + b.Col * (AW + AG)) * s
-			local y0 = v.Y + (AY + b.Row * (AH + AG) - 78) * s
-			if p.X >= x0 - 3 and p.X <= x0 + (AW + 3) * s and p.Y >= y0 - 3 and p.Y <= y0 + (AH + 3) * s then return key end
+			if inAction(self, b, p, v, s) then return key end
 		end
+		return nil
+	end
+
+	function Banner:HitTest(p) -- one call for the receiver: ("act", key, depth) / ("card", nil, depth) / nil. depth = distance from the camera: when banners overlap, the NEAREST one is drawn on top and alone gets the tap
+		local v, s = self:_screen()
+		if not v then return nil end
+		if self.ActBtn then
+			for key, b in pairs(self.ActBtn) do
+				if inAction(self, b, p, v, s) then return "act", key, v.Z end
+			end
+		end
+		if inCard(self, p, v, s) then return "card", nil, v.Z end
 		return nil
 	end
 

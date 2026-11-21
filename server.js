@@ -37,6 +37,31 @@ setInterval(() => { const now = Date.now(); for (const [r, m] of cmds) { for (co
 // ---- blacklist: blacklist.json lives in the GitHub repo; /blacklist and /unblacklist edit it through the GitHub contents API ----
 // env: GITHUB_TOKEN (fine-grained token, Contents: read + write on the repo), GITHUB_REPO ("owner/repo"), GITHUB_BRANCH (default main), BLACKLIST_PATH (default blacklist.json)
 const GH_REPO = process.env.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system", GH_BRANCH = process.env.GITHUB_BRANCH || "main", BL_PATH = process.env.BLACKLIST_PATH || "blacklist.json";
+// ---- OWNER-only override of verified immunity: the roles.json "owner" role (NOT co-owner) may moderate / blacklist plain verified moderators. Ids are read from roles.json on GitHub
+// (names resolved through the Roblox users API) every 60 s and the last good lists are kept; owner + co-owner (hardcoded names + roles.json) stay protected from everyone. ----
+let roleOwners = new Set(), roleAll = new Set();
+const refreshRoles = async () => {
+  try {
+    const r = await fetch(`https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/roles.json?t=${Date.now()}`);
+    if (!r.ok) return;
+    const d = await r.json(), own = new Set(), all = new Set(), ownNames = new Set(), allNames = new Set();
+    for (const x of Array.isArray(d && d.entries) ? d.entries : []) {
+      const role = String((x && x.role) || "").toLowerCase();
+      if (role !== "owner" && role !== "co-owner") continue;
+      const id = Math.floor(Number(x.userId)) || 0, n = typeof x.username === "string" ? x.username.toLowerCase() : "";
+      if (id > 0) { all.add(String(id)); if (role === "owner") own.add(String(id)); }
+      if (/^[0-9a-z_]{3,20}$/.test(n)) { allNames.add(n); if (role === "owner") ownNames.add(n); }
+    }
+    if (allNames.size) {
+      const rr = await fetch("https://users.roblox.com/v1/usernames/users", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ usernames: [...allNames], excludeBannedUsers: false }) });
+      const j = await rr.json();
+      for (const u of (j && j.data) || []) { const n = String(u.requestedUsername || u.name).toLowerCase(); all.add(String(u.id)); if (ownNames.has(n)) own.add(String(u.id)); }
+    }
+    roleOwners = own; roleAll = all;
+  } catch {}
+};
+refreshRoles(); setInterval(refreshRoles, 60000).unref();
+const ownerMayHit = (by, target) => String(by) !== String(target) && roleOwners.has(String(by)) && !isOwnerId(target) && !roleAll.has(String(target));
 const ghUrl = `https://api.github.com/repos/${GH_REPO}/contents/${BL_PATH}`;
 const ghHeaders = () => ({ Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "uh-mod-visual-system", "X-GitHub-Api-Version": "2022-11-28" });
 let blLock = Promise.resolve();
@@ -126,7 +151,8 @@ http.createServer((req, res) => {
       if (!ID.test(by) || !ID.test(target)) return send(res, 400, { error: "bad" });
       if (!isOwnerId(by) && !ownerKeyOk(b.key || "")) return send(res, 403, { error: "owner / co-owner only" });
       if (!process.env.GITHUB_TOKEN) return send(res, 503, { error: "GITHUB_TOKEN is not set on the backend" });
-      if (p === "/blacklist" && (isMod(target) || target === by)) return send(res, 403, { error: "immune" });
+      if (p === "/blacklist" && target === by) return send(res, 403, { error: "immune" });
+      if (p === "/blacklist" && isMod(target) && !(ownerMayHit(by, target) && (OWNER_KEY === "" || ownerKeyOk(b.key || "")))) return send(res, 403, { error: "immune" }); // OWNER-only override (owner secret required whenever the backend has one)
       if (now - (lastCmd.get("bl" + by) || 0) < 1000) return send(res, 429, { error: "slow down" });
       lastCmd.set("bl" + by, now);
       const mutate = p === "/blacklist"
@@ -146,7 +172,10 @@ http.createServer((req, res) => {
       const by = String(b.userId), target = String(b.target), now = Date.now();
       if (!ID.test(by) || !ID.test(target) || !ACTIONS.has(b.action)) return send(res, 400, { error: "bad" });
       if (!isOwnerId(by) && !ownerKeyOk(b.key || "") && !authMod(b.key || "", by)) return send(res, 403, { error: "not a moderator / key already used by someone else" });
-      if (isMod(target)) return send(res, 403, { error: "immune" });
+      if (isMod(target)) { // OWNER-only override: only the roles.json OWNER, proven by the live banner token, may hit a plain verified moderator; owner / co-owner targets and everyone else stay immune
+        const mine = live(b.room)[by];
+        if (!ownerMayHit(by, target) || !mine || typeof b.token !== "string" || mine.token !== b.token) return send(res, 403, { error: "immune" });
+      }
       if (!live(b.room)[target]) return send(res, 404, { error: "target is not running the script" });
       if (now - (lastCmd.get(by) || 0) < 1500) return send(res, 429, { error: "slow down" });
       lastCmd.set(by, now);

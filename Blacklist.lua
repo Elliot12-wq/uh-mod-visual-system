@@ -70,7 +70,7 @@ return function(Env)
 		if not (Env.IsOwner and Env.IsOwner()) then return false, "owner / co-owner only" end
 		local body = {room = Env.Room, by = Env.Player.Name, byId = Env.Player.UserId}
 		for k, v in pairs(extra) do body[k] = v end
-		if body.banDevice or path:sub(1, 8) == "/device/" then -- permanent device bans also need the owner secret set on the backend (read from UhBannerConfig.OwnerKey, never stored in this script)
+		if body.banDevice or path == "/blacklist" or path:sub(1, 8) == "/device/" then -- permanent device bans (and an OWNER blacklisting a verified moderator) also use the owner secret set on the backend (read from UhBannerConfig.OwnerKey, never stored in this script)
 			local okC, c = pcall(function() return (getgenv and getgenv().UhBannerConfig or {}).OwnerKey end)
 			if okC and type(c) == "string" and c ~= "" then body.key = c end
 		end

@@ -1,7 +1,7 @@
 -- VerifiedPlayerFeatures.lua | Bring Users / Hallucinate Users / Dizzy / Silent Hell (10 s, recipient-side, ends with the existing Kill)
 -- ONE permission gate for all three features: OWNER, CO-OWNER and VERIFIED players have identical access. Roles come from roles.json + whitelist.json through
 -- BannerReceiver.RoleOf (nothing hardcoded); anyone else gets no controls and cannot send.
--- Targets: only OTHER script users with a live banner (R.Banners), never owner / co-owner / verified. The target is always notified (toast), no prompt.
+-- Targets: only OTHER script users with a live banner (R.Banners), never owner / co-owner; verified players only when the sender is the OWNER (R.CanTarget). The target is always notified (toast), no prompt.
 -- Env.Fx.SetEnabled(false) turns the effects off for a user entirely.
 -- Transport: ModTools relays the request through the backend's /mod (the backend re-checks the sender); the recipient's ModTools hands every queued command to F.Receive.
 -- Durations are effect lengths, NOT cooldowns (hallucinate 60 s, dizzy 20 s). Every effect registers a stop function: expiry, re-trigger, respawn and unload all clean up.
@@ -27,7 +27,7 @@ return function(Env, R)
 		if not F.CanUse() then return false, "verified players, owner and co-owner only" end
 		target = tonumber(target)
 		if not target or target == Env.Player.UserId then return false, "bad target" end
-		if R.IsWhitelisted(target) then return false, "verified players are immune" end
+		if not R.CanTarget(target) then return false, "verified players are immune" end
 		if not (R.Banners and R.Banners[target] and Players:GetPlayerByUserId(target)) then return false, "not an active script user" end
 		local body = {room = Env.Room, userId = Env.Player.UserId, token = Env.Token, key = Env.ModKey, target = target, action = action}
 		if Env.Sign then body = Env.Sign("/mod", body, tostring(target) .. ":" .. action) end
@@ -550,7 +550,7 @@ return function(Env, R)
 		if type(c) ~= "table" or not ACT[c.action] then return false end
 		local by, action = tonumber(c.by), c.action
 		if not by or by == Env.Player.UserId or not F.Can(by) then return true end -- sender must be owner / co-owner / verified
-		if not F.Enabled or R.IsWhitelisted(Env.Player.UserId) then return true end -- switched off, or an immune role
+		if not F.Enabled or not R.CanBeModeratedBy(by) then return true end -- switched off, or an immune recipient (verified recipients accept only an OWNER in this server)
 		local sp = Players:GetPlayerByUserId(by)
 		if not sp then return true end -- the sender must actually be in this server
 		if action == "bring" then

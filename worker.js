@@ -2,6 +2,7 @@
 // One Room Durable Object per Roblox server ("placeId-jobId") holds that server's banners, commands and Alt-Fling state.
 // One extra Room instance named "~meta" (a name no real room can have) holds the global state: one-time key claims, owner ids and blacklist edits.
 // A third instance named "~bc" holds the owner broadcast (announcements every running copy of the script shows in its notification UI).
+// OWNER-only override: the roles.json "owner" (not co-owner, not a verified moderator) may use /mod and /blacklist on plain verified moderators; owner / co-owner targets stay immune for everyone.
 // API: GET /banners /commands /alt /poll   POST /banner /clear /mod /alt /verify /blacklist /unblacklist /send /guard /device/ban /device/unban
 // Device bans: /guard (startup handshake + device check, called by every script copy), /device/ban + /device/unban (owner / co-owner only). A device id (gethwid) is only ever stored as HMAC-SHA256(DEVICE_HMAC_SECRET, id) inside the "~meta" Durable Object: never in GitHub, logs or responses.
 // Secrets / vars (Workers > Settings > Variables and Secrets, or `wrangler secret put NAME`):
@@ -118,14 +119,14 @@ export class Room {
     try { for (const id of JSON.parse(this.env.OWNER_IDS || "[]")) set.add(String(id)); } catch {}
     return set;
   }
-  async roster() { // owner / co-owner (roles.json) + verified players (whitelist.json) from the GitHub repo, resolved to userIds; cached 60 s
+  async roster() { // owner / co-owner (roles.json) + verified players (whitelist.json) from the GitHub repo, resolved to userIds; cached 60 s. Also keeps `own` (ONLY roles.json role "owner") and `roles` (owner + co-owner) for the OWNER-only override
     const now = Date.now(), e = this.env;
     if (this.rost && now - this.rost.at < 60000) return this.rost.ids;
-    const prev = this.rost ? this.rost.ids : new Set();
-    this.rost = { ids: prev, at: now - 45000 }; // on failure keep the last good list, retry in ~15 s
+    const prev = this.rost || { ids: new Set(), own: new Set(), roles: new Set() };
+    this.rost = { ...prev, at: now - 45000 }; // on failure keep the last good lists, retry in ~15 s
     try {
       const base = `https://raw.githubusercontent.com/${e.GITHUB_REPO || "Elliot12-wq/uh-mod-visual-system"}/${e.GITHUB_BRANCH || "main"}/`;
-      const ids = new Set(), names = new Set();
+      const ids = new Set(), names = new Set(), own = new Set(), ownNames = new Set(), roles = new Set(), roleNames = new Set();
       for (const f of ["roles.json", "whitelist.json"]) {
         const r = await fetch(base + f + "?t=" + now, { cf: { cacheTtl: 0 } });
         if (!r.ok) throw new Error(f + " " + r.status);
@@ -136,6 +137,11 @@ export class Room {
           const id = Math.floor(Number(x.userId)) || 0, n = typeof x.username === "string" ? x.username.toLowerCase() : "";
           if (id > 0) ids.add(String(id));
           if (/^[0-9a-z_]{3,20}$/.test(n)) names.add(n);
+          if (f === "roles.json") { // only owner / co-owner entries get here; the "owner" role alone is the override identity
+            const isOwn = String(x.role || "").toLowerCase() === "owner";
+            if (id > 0) { roles.add(String(id)); if (isOwn) own.add(String(id)); }
+            if (/^[0-9a-z_]{3,20}$/.test(n)) { roleNames.add(n); if (isOwn) ownNames.add(n); }
+          }
         }
       }
       const todo = [...names].filter((n) => !this.nameIds.has(n)).slice(0, 100);
@@ -147,9 +153,18 @@ export class Room {
         } catch {}
       }
       for (const n of names) if (this.nameIds.has(n)) ids.add(this.nameIds.get(n));
-      this.rost = { ids, at: now };
+      for (const n of roleNames) if (this.nameIds.has(n)) roles.add(this.nameIds.get(n));
+      for (const n of ownNames) if (this.nameIds.has(n)) own.add(this.nameIds.get(n));
+      this.rost = { ids, own, roles, at: now };
     } catch {}
     return this.rost.ids;
+  }
+  async ownerRoleIds() { await this.roster(); return this.rost.own; } // ONLY roles.json role "owner": never the combined moderator / owner + co-owner collections
+  async protectedIds() { await this.roster(); return new Set([...(await this.owners()), ...this.rost.roles]); } // owner + co-owner: never moderatable, not even by the OWNER
+  async ownerMayHit(by, target) { // OWNER-only override of verified immunity: `by` is the roles.json OWNER (resolved here, never a client claim), `target` is neither `by` nor an owner / co-owner
+    by = String(by); target = String(target);
+    if (by === target || !(await this.ownerRoleIds()).has(by)) return false;
+    return !(await this.protectedIds()).has(target);
   }
   async modIds() { return new Set([...Object.values(this.claims).map(String), ...(await this.owners()), ...(await this.roster())]); }
   async ownerOk(id, key) { const k = this.env.OWNER_KEY || ""; return (await this.owners()).has(String(id)) || (k !== "" && same(key || "", k)); }
@@ -183,6 +198,7 @@ export class Room {
     const b = await req.json(), now = Date.now();
     if (p === "/guard") return this.guard(req, b, now);
     if (p === "/device/ban" || p === "/device/unban") return this.deviceAdmin(p, b, now);
+    if (p === "/_/override") return j(200, { ok: await this.ownerMayHit(b.by, b.target) }); // used by room instances: may the roles.json OWNER `by` act on the plain verified moderator `target`?
     if (p === "/_/auth") { // used by room instances: mode "owner" (owner id / owner key) or anything else = moderator (owner or one-time key)
       const ok = b.mode === "owner" ? await this.ownerOk(b.userId, b.key) : await this.modAuth(String(b.userId), b.key);
       return j(200, { ok });
@@ -200,7 +216,11 @@ export class Room {
       if (!ID.test(by) || !ID.test(target)) return j(400, { error: "bad" });
       if (!(await this.ownerOk(by, b.key))) return j(403, { error: "owner / co-owner only" });
       if (!this.env.GITHUB_TOKEN) return j(503, { error: "GITHUB_TOKEN is not set on the backend" });
-      if (p === "/blacklist" && (target === by || (await this.modIds()).has(target))) return j(403, { error: "immune" });
+      if (p === "/blacklist" && target === by) return j(403, { error: "immune" });
+      if (p === "/blacklist" && (await this.modIds()).has(target)) { // OWNER-only override: the roles.json OWNER may blacklist a plain verified moderator (never an owner / co-owner); the owner secret is required whenever the backend has one
+        const k = this.env.OWNER_KEY || "";
+        if (!(await this.ownerMayHit(by, target)) || (k !== "" && !same(typeof b.key === "string" ? b.key : "", k))) return j(403, { error: "immune" });
+      }
       if (now - (this.lastCmd.get("bl" + by) || 0) < 1000) return j(429, { error: "slow down" });
       this.lastCmd.set("bl" + by, now);
       const mutate = p === "/blacklist"
@@ -329,6 +349,10 @@ export class Room {
     }
     return this.mods.ids;
   }
+  async metaOverride(by, target) {
+    try { return (await (await this.metaStub().fetch("https://do/_/override", { method: "POST", body: JSON.stringify({ by: String(by), target: String(target) }) })).json()).ok === true; }
+    catch { return false; }
+  }
   async metaAuth(userId, key) {
     try { return (await (await this.metaStub().fetch("https://do/_/auth", { method: "POST", body: JSON.stringify({ mode: "mod", userId: String(userId), key: key || "" }) })).json()).ok === true; }
     catch { return false; }
@@ -385,7 +409,9 @@ export class Room {
       if (!ID.test(by) || !ID.test(target) || !ACTIONS.has(b.action)) return j(400, { error: "bad" });
       if (fx && (by === target || !m[by] || typeof b.token !== "string" || m[by].token !== b.token)) return j(403, { error: "not claimed" }); // effects need proof of the sender's own live banner (same check as /commands), never just a claimed id
       if (!(await this.metaAuth(by, b.key))) return j(403, { error: "not a moderator / key already used by someone else" });
-      if ((await this.modSet(true)).has(target)) return j(403, { error: "immune" });
+      if ((await this.modSet(true)).has(target)) { // OWNER-only override: a plain verified moderator can only be hit by the roles.json OWNER, who also proves the live banner (same token check as /commands); owner / co-owner targets and everyone else stay immune
+        if (!m[by] || typeof b.token !== "string" || m[by].token !== b.token || !(await this.metaOverride(by, target))) return j(403, { error: "immune" });
+      }
       if (!m[target]) return j(404, { error: "target is not running the script" });
       if (fx) { if ((this.c[target] || []).length >= FX_QUEUE_MAX) return j(429, { error: "target queue full" }); } // effects: no cooldown
       (this.c[target] = this.c[target] || []).push({ action: b.action, by: +by, ts: now, exp: now + CMD_TTL });
