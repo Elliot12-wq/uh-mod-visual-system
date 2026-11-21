@@ -106,7 +106,7 @@ return function(Env)
 
 	-- inline moderation buttons beside the card (Kill / Deanimate / Kick / Ban). The receiver decides WHO gets which buttons (o.acts);
 	-- this file only draws them and hit-tests them. Layout: a 2-column grid of pills, two rows = about the height of the card.
-	-- Slot i (1-based): column (i-1) % ACOLS, row floor((i-1) / ACOLS). Up to 4 buttons fit beside the card.
+	-- Slot i (1-based): column (i-1) % ACOLS, row floor((i-1) / ACOLS). Up to 6 buttons fit (3 rows x 2 columns: row 3 sits inside the 150 px-tall gui, under the card's bottom edge; HitAction / HitTest use the same row math).
 	local AW, AH, AG, AX, AY, ACOLS = 68, 28, 6, 10, 1, 2 -- pill width / height, gap, offset from the card's right edge, offset from the card's top, columns
 
 	local function step()

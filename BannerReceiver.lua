@@ -158,6 +158,7 @@ return function(Env, UI)
 		{key = "kick", label = "Kick", color = Color3.fromRGB(196, 146, 38), mod = true},
 		{key = "dropbomb", label = "Drop Bomb", color = Color3.fromRGB(255, 82, 18), mod = true},
 		{key = "ban", label = "Ban", color = Color3.fromRGB(190, 50, 60), ban = true},
+		{key = "domain", label = "Domain", color = Color3.fromRGB(64, 84, 235), mod = true},
 	}
 	local function actionsFor(uid) -- the buttons THIS viewer may use on that player's banner; nothing on yourself or on OWNER / CO-OWNER; verified moderators only for the OWNER (R.CanTarget)
 		if not R.CanTarget(uid) then return nil end
@@ -311,7 +312,7 @@ end
 		local items = {{"Teleport", Color3.fromRGB(60, 110, 200), function() R.Teleport(uid) end}}
 		if mod then table.insert(items, {"Users...", Color3.fromRGB(60, 140, 120), function() R.OpenUsers() end}) end
 		if mod then -- moderators: relayed to script users (verified players only when the sender is the OWNER; never owner / co-owner)
-			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}, {"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb"}}) do
+			for _, a in ipairs({{"Kill", "kill"}, {"Deanimate", "deanimate"}, {"Kick", "kick"}, {"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb"}, {"Domain", "domain"}}) do
 				table.insert(items, {a[1], Color3.fromRGB(205, 125, 40), function()
 					task.spawn(function()
 						local ok, err = Env.Mod.Send(uid, a[2])
@@ -327,7 +328,8 @@ end
 				end)
 			end})
 		end
-		local H = 8 + #items * 34
+		local PITCH = math.clamp(math.floor(((workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 600) - 16) / #items), 22, 34) -- rows shrink on short screens so every action (Domain included) stays on screen
+		local H = 8 + #items * PITCH
 		local gui = Instance.new("ScreenGui")
 		gui.Name, gui.ResetOnSpawn, gui.DisplayOrder, gui.IgnoreGuiInset = "UhBannerMenu", false, 900, true
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
@@ -336,11 +338,11 @@ end
 		f.Size, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(150, H), Color3.fromRGB(24, 24, 30), 0
 		local cam = workspace.CurrentCamera
 		local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
-		f.Position = UDim2.fromOffset(math.clamp(pt.X, 0, vp.X - 150), math.clamp(pt.Y, 0, vp.Y - H))
+		f.Position = UDim2.fromOffset(math.clamp(pt.X, 0, vp.X - 150), math.clamp(pt.Y, 0, math.max(0, vp.Y - H)))
 		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
 		for i, it in ipairs(items) do
 			local b = Instance.new("TextButton", f)
-			b.Size, b.Position, b.Text = UDim2.fromOffset(134, 28), UDim2.fromOffset(8, 8 + (i - 1) * 34), it[1]
+			b.Size, b.Position, b.Text = UDim2.fromOffset(134, PITCH - 6), UDim2.fromOffset(8, 8 + (i - 1) * PITCH), it[1]
 			b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = it[2], Color3.new(1, 1, 1), Enum.Font.GothamBold, 14
 			Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
 			b.Activated:Connect(function() R.CloseMenu(); it[3]() end)
@@ -359,7 +361,9 @@ end
 		gui.Parent = Env.Player:WaitForChild("PlayerGui")
 		picker = gui
 		local f = Instance.new("Frame", gui)
-		f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel = UDim2.fromOffset(520, 270), UDim2.new(0.5, -260, 0.5, -135), Color3.fromRGB(24, 24, 30), 0
+		f.AnchorPoint, f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel = Vector2.new(0.5, 0.5), UDim2.fromOffset(600, 270), UDim2.fromScale(0.5, 0.5), Color3.fromRGB(24, 24, 30), 0 -- 600 wide: 92 px name + six 80 px buttons (Domain is the sixth)
+		local vx = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X) or 800
+		if vx < 620 then Instance.new("UIScale", f).Scale = math.max(vx / 620, 0.5) end -- narrow phones: scale the whole panel down instead of clipping buttons
 		Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
 		local t = Instance.new("TextLabel", f)
 		t.Size, t.Position, t.BackgroundTransparency, t.Text = UDim2.new(1, -44, 0, 28), UDim2.fromOffset(10, 4), 1, "Active script users"
@@ -383,7 +387,7 @@ end
 				local nm = Instance.new("TextLabel", row)
 				nm.Size, nm.BackgroundTransparency, nm.Text = UDim2.new(0, 92, 1, 0), 1, p.DisplayName
 				nm.TextColor3, nm.Font, nm.TextSize, nm.TextXAlignment, nm.TextTruncate = Color3.new(1, 1, 1), Enum.Font.GothamMedium, 13, Enum.TextXAlignment.Left, Enum.TextTruncate.AtEnd
-				for i, a in ipairs({{"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb", Color3.fromRGB(255, 82, 18)}}) do
+				for i, a in ipairs({{"Bring", "bring"}, {"Hallucinate", "hallucinate"}, {"Dizzy", "dizzy"}, {"Silent Hell", "silenthell"}, {"Drop Bomb", "dropbomb", Color3.fromRGB(255, 82, 18)}, {"Domain", "domain", Color3.fromRGB(64, 84, 235)}}) do
 					local b = Instance.new("TextButton", row)
 					b.Size, b.Position, b.Text = UDim2.fromOffset(78, 28), UDim2.fromOffset(92 + (i - 1) * 80, 1), a[1]
 					b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize = a[3] or Color3.fromRGB(60, 110, 200), Color3.new(1, 1, 1), Enum.Font.GothamBold, 11

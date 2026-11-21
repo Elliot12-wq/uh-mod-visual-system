@@ -10,11 +10,11 @@ return function(Env, R)
 	local Players, RS, HS = Env.Players, Env.RunService, Env.HttpService
 	local genv = (getgenv and getgenv()) or _G
 	local F = {Enabled = genv.UhFxEnabled ~= false}
-	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true}
+	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true, domain = true}
 	local BOMB_LIFE = 10.0 -- Drop Bomb: explosion lifetime in seconds, counted from the detonation (the fall is not part of it)
-	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE}
-	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE} -- default effect lengths (TIME may be overridden per command by F.Run)
-	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}, {key = "dropbomb", label = "Drop Bomb"}}
+	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30}
+	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30} -- default effect lengths (TIME may be overridden per command by F.Run; Domain is fixed at 30 s)
+	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}, {key = "dropbomb", label = "Drop Bomb"}, {key = "domain", label = "Domain", desc = "Activates Gojo's Unlimited Void domain around the selected player for 30 seconds"}}
 	F.Time = TIME
 
 	-- ===== permissions: the single gate =====
@@ -552,6 +552,337 @@ return function(Env, R)
 		end)
 	end
 
+	-- ===== Domain (Gojo's Unlimited Void) =====
+	-- 30 s Domain Expansion that runs ONLY on this client (nothing here is replicated to other players). The recipient cannot move for the whole 30 s: the lock starts the moment the command arrives,
+	-- before any visual exists, and covers the real character AND the active (reanimated) one - Humanoid walk / jump values + the PlayerModule controls, re-applied every step (nothing is anchored, destroyed or
+	-- disconnected; no teleport, no damage, no Kill / Deanimate). Only the values THIS effect changed are restored. Visuals: expansion (darken, blue-white flash, shock discs, shell + void floor expand) ->
+	-- Unlimited Void (starfield, tilted rotating rings, orbiting fragments, energy arcs, light rays from the void core, drifting particles; camera-local grade / bloom / blur, Lighting is never touched) ->
+	-- collapse (everything contracts and fades over the last 3 s). Everything lives in the ONE container "UhDomainExpansion" (+ the camera post effects). ONE stop function cleans up every exit
+	-- (30 s expiry, re-trigger, respawn, FX disabled, unload, lost character).
+	local function domain()
+		stopFx("domain")
+		if not F.Enabled then return end
+		local cam = workspace.CurrentCamera
+		local me0 = myChar()
+		local function rootOf(ch) return ch and (ch:FindFirstChild("HumanoidRootPart") or ch.PrimaryPart or ch:FindFirstChildWhichIsA("BasePart")) or nil end
+		local root0 = rootOf(me0)
+		if not (cam and root0) then return toast("Domain unavailable: no character") end
+		local TS = Env.TweenService or game:GetService("TweenService")
+		local T, INTRO, OUTRO = TIME.domain, 3.0, 3.0 -- expansion runs 0.6 -> 3.6 s, collapse over the last OUTRO seconds
+		local TC = T - OUTRO
+		local okL, lowE = pcall(function() return Env.IsLowEnd and Env.IsLowEnd() end)
+		local low = (okL and lowE) and true or false
+		local interval = low and 1 / 20 or 0
+		local R = low and 140 or 170 -- domain radius (studs)
+		local ctr = root0.Position + Vector3.new(0, 2, 0)
+		local rnd = Random.new()
+		local C_VOID, C_NAVY, C_INDIGO = Color3.fromRGB(4, 6, 22), Color3.fromRGB(10, 14, 52), Color3.fromRGB(34, 22, 104)
+		local C_BLUE, C_VIOLET, C_WHITE = Color3.fromRGB(80, 130, 255), Color3.fromRGB(130, 96, 255), Color3.fromRGB(226, 240, 255)
+
+		local t0 = os.clock()
+		local lost, ph, lastE = nil, 0, -1
+		local tw, frozen, snd, ctl, ctlOff, conn, cconn = {}, {}, nil, nil, false, nil, nil
+		local folder = Instance.new("Folder")
+		folder.Name = "UhDomainExpansion"
+		local cc, bl, bu, dof = Instance.new("ColorCorrectionEffect"), Instance.new("BloomEffect"), Instance.new("BlurEffect"), nil
+		cc.Name, bl.Name, bu.Name = "UhDomainGrade", "UhDomainBloom", "UhDomainBlur"
+		bl.Intensity, bl.Size, bl.Threshold, bu.Size = 0, 24, 0.9, 0
+		if not low then
+			dof = Instance.new("DepthOfFieldEffect")
+			dof.Name, dof.FarIntensity, dof.NearIntensity, dof.FocusDistance, dof.InFocusRadius = "UhDomainDepth", 0, 0, 30, 70
+		end
+		local lt, emit, anc -- void-core light / particle emitter / beam anchor (created in build)
+		local st, rigs, bms = {}, {}, {} -- static pieces / rotating rings (+ their fragments) / beams, all revealed by e
+		local sp, sc, ap, ac = {}, {}, {}, {} -- reusable arrays for BulkMoveTo (no per-frame Instance creation)
+
+		local function ease(u) return u * u * (3 - 2 * u) end
+		local function tween(o, secs, props, style, dir)
+			pcall(function()
+				local x = TS:Create(o, TweenInfo.new(secs, style or Enum.EasingStyle.Sine, dir or Enum.EasingDirection.InOut), props)
+				tw[#tw + 1] = x
+				x:Play()
+			end)
+		end
+
+		-- ----- movement lock (real character + active reanimated character + PlayerModule controls) -----
+		local function hold(h) -- freeze one Humanoid; records only what THIS effect changes, a value somebody else sets meanwhile becomes the one restored
+			local r = frozen[h]
+			if not r then r = {up = h.UseJumpPower}; frozen[h] = r end
+			if h.WalkSpeed ~= 0 then r.ws = h.WalkSpeed; h.WalkSpeed = 0 end
+			if h.JumpPower ~= 0 then r.jp = h.JumpPower; h.JumpPower = 0 end
+			if h.JumpHeight ~= 0 then r.jh = h.JumpHeight; h.JumpHeight = 0 end
+		end
+		local function lockCtl() -- walking / jumping input; re-disabled every step in case another effect re-enabled the controls
+			pcall(function()
+				if not ctl then
+					local ps = Env.Player:FindFirstChild("PlayerScripts")
+					local pm = ps and ps:FindFirstChild("PlayerModule")
+					ctl = pm and require(pm):GetControls() or nil
+				end
+				if ctl and ctl.controlsEnabled ~= false then ctl:Disable(); ctlOff = true end
+			end)
+		end
+		local function lockMove() -- returns the active character (myChar())
+			local me = myChar()
+			for _, ch in ipairs({Env.Player.Character or false, me or false}) do
+				local h = ch and ch:FindFirstChildOfClass("Humanoid")
+				if h then hold(h) end
+			end
+			lockCtl()
+			return me
+		end
+
+		local function stop() -- the ONE cleanup
+			if conn then conn:Disconnect(); conn = nil end
+			if cconn then cconn:Disconnect(); cconn = nil end
+			for _, x in ipairs(tw) do pcall(function() x:Cancel() end) end
+			table.clear(tw)
+			if snd then pcall(function() snd:Stop() end); snd = nil end
+			pcall(function() cc:Destroy() end)
+			pcall(function() bl:Destroy() end)
+			pcall(function() bu:Destroy() end)
+			if dof then pcall(function() dof:Destroy() end) end
+			pcall(function() folder:Destroy() end)
+			for h, r in pairs(frozen) do
+				pcall(function()
+					if h.Parent then
+						if r.ws then h.WalkSpeed = r.ws end
+						if r.jp then h.JumpPower = r.jp end
+						if r.jh then h.JumpHeight = r.jh end
+						if r.jp or r.jh then h.UseJumpPower = r.up end -- last: writing JumpPower / JumpHeight can flip it
+					end
+				end)
+			end
+			table.clear(frozen)
+			if ctl and ctlOff then pcall(function() ctl:Enable(true) end); ctlOff = false end
+		end
+		fx.domain = stop
+		expire("domain", stop, T) -- hard stop at exactly 30 s even if the frame loop stalls
+		pcall(lockMove) -- movement is locked NOW, before any visual is built
+		cconn = Env.Player.CharacterAdded:Connect(function() stopFx("domain") end) -- respawn: back to normal at once
+
+		-- ----- visuals -----
+		local function mk(name, shape, size, color, mat, tr, cf) -- anchored, non-colliding, non-queryable cosmetic part inside the container
+			local p = Instance.new("Part")
+			p.Shape = shape
+			p.Name, p.Size, p.Color, p.Material, p.Transparency = name, size, color, mat, tr
+			p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.CastShadow, p.Massless = true, false, false, false, false, true
+			p.TopSurface, p.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+			p.CFrame = cf or CFrame.new(ctr)
+			p.Parent = folder
+			return p
+		end
+		local function reveal(e) -- e = 0 (hidden, contracted) .. 1 (fully expanded); only runs while e changes (expansion / collapse)
+			local s = 0.08 + 0.92 * e
+			for i, it in ipairs(st) do
+				local p = it.p
+				sp[i] = p
+				sc[i] = CFrame.new(ctr + it.off * s) * it.rot
+				if it.size then p.Size = it.size * s end
+				p.Transparency = 1 - (1 - it.tr) * e
+			end
+			workspace:BulkMoveTo(sp, sc, Enum.BulkMoveMode.FireCFrameChanged)
+			for _, rg in ipairs(rigs) do
+				rg.p.Size = Vector3.new(0.3, 2 * rg.r * s, 2 * rg.r * s)
+				rg.p.Transparency = 1 - 0.1 * e
+				for _, fr in ipairs(rg.fr) do fr.p.Transparency = 1 - (1 - fr.tr) * e end
+			end
+			for _, bm in ipairs(bms) do bm.b.Width0, bm.b.Width1 = bm.w * e, bm.w * e end
+		end
+		local function animate(t, e) -- the rotating pieces: ring discs (the beam dashes ride on them), orbiting fragments, the sweeping beam anchor
+			local s = 0.08 + 0.92 * e
+			local k = 0
+			for _, rg in ipairs(rigs) do
+				local cf = CFrame.new(ctr) * rg.tilt * CFrame.Angles(t * rg.spd, 0, 0)
+				k += 1; ap[k] = rg.p; ac[k] = cf
+				for _, fr in ipairs(rg.fr) do
+					k += 1; ap[k] = fr.p
+					ac[k] = cf * CFrame.new(0, math.cos(fr.a) * rg.r * s, math.sin(fr.a) * rg.r * s) * CFrame.Angles(t * fr.x, t * fr.y, t * fr.z)
+				end
+			end
+			workspace:BulkMoveTo(ap, ac, Enum.BulkMoveMode.FireCFrameChanged)
+			if anc then anc.CFrame = CFrame.new(ctr) * CFrame.Angles(0, t * 0.05, 0) end
+		end
+		local function build()
+			folder.Parent = cam
+			cc.Parent, bl.Parent, bu.Parent = cam, cam, cam
+			if dof then dof.Parent = cam end
+			local function add(p, off, rot, size, tr) st[#st + 1] = {p = p, off = off, rot = rot, size = size, tr = tr} end
+			-- dome shell: inward-facing tiles on a Fibonacci sphere (closed blocks, so their inner faces are what you see from inside)
+			local NP = low and 20 or 36
+			local gold = math.pi * (3 - math.sqrt(5))
+			local side = math.sqrt(4 * math.pi / NP) * R * 1.3
+			local tiles = {C_VOID, C_NAVY, C_INDIGO}
+			for i = 1, NP do
+				local y = 1 - (i - 0.5) / NP * 2
+				local rr = math.sqrt(1 - y * y)
+				local dir = Vector3.new(math.cos(gold * i) * rr, y, math.sin(gold * i) * rr)
+				local p = mk("Shell", Enum.PartType.Block, Vector3.new(side, side, 1), tiles[1 + (i % 3)], Enum.Material.SmoothPlastic, 1)
+				add(p, dir * R, CFrame.lookAt(Vector3.zero, -dir) * CFrame.Angles(0, 0, rnd:NextNumber(0, math.pi)), Vector3.new(side, side, 1), 0.08)
+			end
+			-- distant stars at different depths (parallax gives the sense of infinite space)
+			for i = 1, (low and 26 or 64) do
+				local rad = R * rnd:NextNumber(0.3, 0.92)
+				local z = rnd:NextNumber(0.5, 1.2) * rad / 45
+				local p = mk("Star", Enum.PartType.Ball, Vector3.new(z, z, z), (i % 3 == 0) and C_BLUE or C_WHITE, Enum.Material.Neon, 1)
+				add(p, rnd:NextUnitVector() * rad, CFrame.new(), nil, 0.05)
+			end
+			-- void floor over the real ground + a glowing circle under the target
+			local rp = RaycastParams.new()
+			rp.FilterType, rp.RespectCanCollide = Enum.RaycastFilterType.Exclude, true
+			rp.FilterDescendantsInstances = {folder, me0, Env.Player.Character or folder}
+			local hit = workspace:Raycast(root0.Position, Vector3.new(0, -80, 0), rp)
+			local oy = (hit and hit.Position.Y or (root0.Position.Y - 3)) - ctr.Y
+			local flat = CFrame.Angles(0, 0, math.pi / 2)
+			local ground = mk("VoidFloor", Enum.PartType.Cylinder, Vector3.new(1, 2 * R, 2 * R), C_VOID, Enum.Material.SmoothPlastic, 1)
+			ground.Reflectance = 0.12
+			add(ground, Vector3.new(0, oy - 0.4, 0), flat, Vector3.new(1, 2 * R, 2 * R), 0)
+			add(mk("Rune", Enum.PartType.Cylinder, Vector3.new(1, 26, 26), C_BLUE, Enum.Material.Neon, 1), Vector3.new(0, oy - 0.3, 0), flat, Vector3.new(1, 26, 26), 0.55)
+			-- luminous blue-white void core high above the target, with layered halos and a light
+			local coreOff = Vector3.new(0, 78, 0)
+			local core = mk("VoidCore", Enum.PartType.Ball, Vector3.new(22, 22, 22), C_WHITE, Enum.Material.Neon, 1)
+			add(core, coreOff, CFrame.new(), Vector3.new(22, 22, 22), 0)
+			add(mk("VoidHalo1", Enum.PartType.Ball, Vector3.new(42, 42, 42), C_BLUE, Enum.Material.Neon, 1), coreOff, CFrame.new(), Vector3.new(42, 42, 42), 0.8)
+			add(mk("VoidHalo2", Enum.PartType.Ball, Vector3.new(70, 70, 70), C_VIOLET, Enum.Material.Neon, 1), coreOff, CFrame.new(), Vector3.new(70, 70, 70), 0.93)
+			lt = Instance.new("PointLight")
+			lt.Color, lt.Range, lt.Brightness, lt.Shadows = C_BLUE, 60, 0, false
+			lt.Parent = core
+			-- beams: attachments live on parts of the container, so nothing here costs a per-frame update
+			local function att(p, pos) local a = Instance.new("Attachment"); a.Position = pos; a.Parent = p; return a end
+			local function beam(a0, a1, w, color, curve)
+				local b = Instance.new("Beam")
+				b.Attachment0, b.Attachment1 = a0, a1
+				b.Color = ColorSequence.new(color)
+				b.LightEmission, b.LightInfluence, b.FaceCamera = 1, 0, true
+				b.Width0, b.Width1 = 0, 0
+				if curve then
+					b.Segments, b.CurveSize0, b.CurveSize1 = 20, curve, -curve
+					b.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.2, 0.15), NumberSequenceKeypoint.new(0.8, 0.15), NumberSequenceKeypoint.new(1, 1)})
+				else
+					b.Segments, b.Transparency = 1, NumberSequence.new(0.1)
+				end
+				b.Parent = a0.Parent
+				bms[#bms + 1] = {b = b, w = w}
+			end
+			-- concentric rings at different angles / speeds: a faint disc + dashed beam rim, with fragments orbiting on each ring
+			local RAD, SPD = {0.3, 0.46, 0.64, 0.86}, {0.55, -0.38, 0.26, -0.17}
+			local K, NF = low and 8 or 14, low and 2 or 4
+			for i = 1, (low and 3 or 4) do
+				local r = R * RAD[i]
+				local disc = mk("Ring" .. i, Enum.PartType.Cylinder, Vector3.new(0.3, 2 * r, 2 * r), (i % 2 == 0) and C_VIOLET or C_BLUE, Enum.Material.Neon, 1)
+				local rg = {p = disc, r = r, spd = SPD[i], fr = {}, tilt = CFrame.Angles(rnd:NextNumber(-0.9, 0.9) + (i % 2) * 0.6, rnd:NextNumber(0, 6.28), rnd:NextNumber(-0.7, 0.7))}
+				for j = 0, K - 1 do
+					local a0 = j / K * math.pi * 2
+					local a1 = a0 + math.pi * 2 / K * 0.58
+					beam(att(disc, Vector3.new(0, math.cos(a0) * r, math.sin(a0) * r)), att(disc, Vector3.new(0, math.cos(a1) * r, math.sin(a1) * r)), 1 + i * 0.3, (j % 2 == 0) and C_WHITE or C_BLUE)
+				end
+				for j = 1, NF do
+					local sz = rnd:NextNumber(4, 11)
+					local blk = (j % 2 == 0)
+					local p = mk("Fragment", blk and Enum.PartType.Block or Enum.PartType.Cylinder, blk and Vector3.new(sz, sz * 2.4, sz * 0.5) or Vector3.new(sz * 0.4, sz * 1.6, sz * 1.6),
+						blk and C_INDIGO or C_BLUE, blk and Enum.Material.ForceField or Enum.Material.Neon, 1)
+					rg.fr[j] = {p = p, a = (j - 1) / NF * math.pi * 2 + rnd:NextNumber(-0.3, 0.3), x = rnd:NextNumber(-0.7, 0.7), y = rnd:NextNumber(-0.7, 0.7), z = rnd:NextNumber(-0.7, 0.7), tr = blk and 0.2 or 0.3}
+				end
+				rigs[i] = rg
+			end
+			-- layered energy arcs + thin light rays from the core (the anchor sweeps slowly)
+			anc = mk("Anchor", Enum.PartType.Ball, Vector3.new(1, 1, 1), C_WHITE, Enum.Material.Neon, 1)
+			for i = 1, (low and 3 or 8) do
+				local r0, r1 = R * rnd:NextNumber(0.4, 0.88), R * rnd:NextNumber(0.4, 0.88)
+				beam(att(anc, rnd:NextUnitVector() * r0), att(anc, rnd:NextUnitVector() * r1), rnd:NextNumber(0.8, 1.7), (i % 2 == 0) and C_WHITE or C_VIOLET, rnd:NextNumber(30, 80) * ((i % 2 == 0) and 1 or -1))
+			end
+			for _ = 1, (low and 4 or 10) do
+				local d = rnd:NextUnitVector()
+				beam(att(core, Vector3.zero), att(anc, Vector3.new(d.X, -math.abs(d.Y), d.Z) * R * 0.9), 0.4, C_WHITE)
+			end
+			-- drifting glowing particles through the whole volume (built-in sparkle texture, no external asset)
+			local vol = mk("Volume", Enum.PartType.Block, Vector3.new(R * 1.5, R * 0.8, R * 1.5), C_WHITE, Enum.Material.Neon, 1)
+			emit = Instance.new("ParticleEmitter")
+			emit.Name, emit.Enabled, emit.Rate, emit.Shape = "UhDomainMotes", false, low and 12 or 28, Enum.ParticleEmitterShape.Box
+			emit.Lifetime, emit.Speed, emit.SpreadAngle = NumberRange.new(6, 10), NumberRange.new(1, 5), Vector2.new(180, 180)
+			emit.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.2, 2.2), NumberSequenceKeypoint.new(1, 0)})
+			emit.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.2, 0.15), NumberSequenceKeypoint.new(0.8, 0.3), NumberSequenceKeypoint.new(1, 1)})
+			emit.Color = ColorSequence.new(C_WHITE, C_BLUE)
+			emit.LightEmission, emit.LightInfluence, emit.Drag, emit.Acceleration = 1, 0, 0.6, Vector3.new(0, 1.5, 0)
+			emit.Parent = vol
+			reveal(0)
+		end
+
+		-- ----- cinematic phases -----
+		local function shock() -- three expanding energy discs (the "circular boundary" rushing outward)
+			for i = 1, 3 do
+				local tilt = (i == 1) and 0 or ((i == 2) and 0.9 or -0.9)
+				local sw = mk("Shock" .. i, Enum.PartType.Cylinder, Vector3.new(0.4, 4, 4), (i == 2) and C_BLUE or C_WHITE, Enum.Material.Neon, 0.15, CFrame.new(ctr) * CFrame.Angles(tilt, 0, 0) * CFrame.Angles(0, 0, math.pi / 2))
+				tween(sw, 1.7, {Size = Vector3.new(0.4, 2.3 * R, 2.3 * R), Transparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+				task.delay(1.9, function() pcall(function() sw:Destroy() end) end)
+			end
+		end
+		local function boom() -- the engine's built-in explosion sample, slowed down (rbxasset://, no external asset)
+			local s = Instance.new("Sound")
+			s.Name, s.SoundId, s.Volume, s.PlaybackSpeed = "UhDomainBoom", "rbxasset://sounds/impact_explosion_03.mp3", 0.7, 0.55
+			s.Parent = folder
+			snd = s
+			s:Play()
+		end
+		local function flash()
+			tween(cc, 0.12, {Brightness = 0.85, Contrast = -0.15, Saturation = -0.9, TintColor = C_WHITE}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			tween(bl, 0.12, {Intensity = 3.2, Size = 60}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			tween(bu, 0.12, {Size = 20}, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			if emit then emit:Emit(low and 30 or 80) end
+			shock()
+			boom()
+		end
+		local function voidGrade() -- settle into the deep indigo / blue-white Unlimited Void look
+			tween(cc, 1.6, {Brightness = -0.2, Contrast = 0.3, Saturation = -0.35, TintColor = Color3.fromRGB(150, 170, 255)})
+			tween(bl, 1.6, {Intensity = 1.1, Size = 30, Threshold = 0.85})
+			tween(bu, 1.6, {Size = 0})
+			if dof then tween(dof, 2, {FarIntensity = 0.3}) end
+			if lt then tween(lt, 2, {Brightness = 3}) end
+			if emit then emit.Enabled = true end
+		end
+		local function collapse() -- everything fades back to the original look, finishing exactly at T
+			tween(cc, OUTRO, {Brightness = 0, Contrast = 0, Saturation = 0, TintColor = Color3.new(1, 1, 1)})
+			tween(bl, OUTRO, {Intensity = 0})
+			if dof then tween(dof, OUTRO, {FarIntensity = 0}) end
+			if lt then tween(lt, OUTRO, {Brightness = 0}) end
+			if emit then emit.Enabled = false end
+		end
+
+		local function step()
+			local t = os.clock() - t0
+			if t >= T then return stopFx("domain") end
+			local cur = workspace.CurrentCamera
+			if cur and cur ~= cam then
+				cam = cur
+				folder.Parent, cc.Parent, bl.Parent, bu.Parent = cam, cam, cam, cam
+				if dof then dof.Parent = cam end
+			end
+			local tr = rootOf(lockMove()) -- the movement lock is re-applied EVERY step (new Humanoid after a reanimation swap, controls re-enabled by someone else, ...)
+			if not tr then
+				lost = lost or t
+				if t - lost > 1.5 then stopFx("domain") end -- character / reanimation model gone: clean up
+				return
+			end
+			lost = nil
+			if ph < 1 and t >= 0.55 then ph = 1; flash() end
+			if ph < 2 and t >= 0.75 then ph = 2; voidGrade() end
+			if ph < 3 and t >= TC then ph = 3; collapse() end
+			local e = math.min(ease(math.clamp((t - 0.6) / INTRO, 0, 1)), ease(math.clamp(1 - (t - TC) / OUTRO, 0, 1)))
+			if e ~= lastE then lastE = e; reveal(e) end
+			if e > 0 then animate(t, e) end
+		end
+
+		if not pcall(build) then return stopFx("domain") end
+		tween(cc, 0.55, {Brightness = -0.5, Contrast = 0.15, Saturation = -0.45, TintColor = Color3.fromRGB(130, 140, 210)}) -- phase 1: the scene darkens
+		local acc = interval
+		conn = RS.Heartbeat:Connect(function(dt)
+			acc += dt
+			if acc < interval then return end
+			acc = 0
+			if not pcall(step) then stopFx("domain") end
+		end)
+	end
+
 	-- ===== Drop Bomb =====
 	-- A locally built bomb (Parts / emitters only, nothing replicated) falls from 35 studs above THIS client's active character (myChar()), tracks it while spinning and detonates the moment its nose reaches the
 	-- character (character position + ground raycast, no Touched). At that instant the layered explosion starts and the existing Env.ModActions.Kill runs exactly once. The explosion lives in its own Workspace
@@ -880,6 +1211,9 @@ return function(Env, R)
 		elseif action == "silenthell" then
 			toast(sp.Name .. " sent you to Silent Hell (" .. TIME.silenthell .. " s)")
 			silenthell()
+		elseif action == "domain" then
+			toast(sp.Name .. " activated Domain Expansion: Unlimited Void on you (" .. TIME.domain .. " s)")
+			domain()
 		else
 			toast(sp.Name .. " made you dizzy (" .. TIME.dizzy .. " s)")
 			dizzy()
