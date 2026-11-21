@@ -10,11 +10,11 @@ return function(Env, R)
 	local Players, RS, HS = Env.Players, Env.RunService, Env.HttpService
 	local genv = (getgenv and getgenv()) or _G
 	local F = {Enabled = genv.UhFxEnabled ~= false}
-	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true, domain = true}
+	local ACT = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true, domain = true, cooked = true}
 	local BOMB_LIFE = 10.0 -- Drop Bomb: explosion lifetime in seconds, counted from the detonation (the fall is not part of it)
-	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30}
-	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30} -- default effect lengths (TIME may be overridden per command by F.Run; Domain is fixed at 30 s)
-	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}, {key = "dropbomb", label = "Drop Bomb"}, {key = "domain", label = "Domain", desc = "Activates Gojo's Unlimited Void domain around the selected player for 30 seconds"}}
+	local TIME = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30, cooked = 10}
+	local DEFT = {hallucinate = 60, dizzy = 20, silenthell = 10, dropbomb = BOMB_LIFE, domain = 30, cooked = 10} -- default effect lengths (TIME may be overridden per command by F.Run; Domain is fixed at 30 s)
+	F.Actions = {{key = "bring", label = "Bring Users"}, {key = "hallucinate", label = "Hallucinate Users"}, {key = "dizzy", label = "Dizzy"}, {key = "silenthell", label = "Silent Hell"}, {key = "dropbomb", label = "Drop Bomb"}, {key = "domain", label = "Domain", desc = "Activates Gojo's Unlimited Void domain around the selected player for 30 seconds"}, {key = "cooked", label = "Cooked", desc = "Calls a 5-operator SWAT squad that aims and fires at the selected player for 10 seconds"}}
 	F.Time = TIME
 
 	-- ===== permissions: the single gate =====
@@ -1190,6 +1190,277 @@ return function(Env, R)
 		end)
 	end
 
+	-- ===== Cooked =====
+	-- Recipient-side only (nothing is replicated). Five SWAT operators ring THIS player, track and fire for TIME.cooked s. One Heartbeat loop drives all five, ONE container "UhCooked", ONE stop function
+	-- (expiry, respawn, character lost / dead, FX disabled, unload). A re-trigger while active is ignored (no duplicate squad). One ray per shot: a confirmed hit = exactly COOKED_DMG HP once, a miss = 0.
+	local COOKED_DMG = 3
+	local function cooked()
+		if fx.cooked or not F.Enabled then return end
+		for _, v in ipairs(workspace:GetChildren()) do
+			if v.Name == "UhCooked" then pcall(function() v:Destroy() end) end
+		end
+		local me0 = myChar()
+		local root0 = me0 and (me0:FindFirstChild("HumanoidRootPart") or me0.PrimaryPart)
+		if not root0 then return toast("Cooked unavailable: no character") end
+		local okL, lowE = pcall(function() return Env.IsLowEnd and Env.IsLowEnd() end)
+		local low = okL and lowE == true
+		local C3, V3, CF, ANG, MT = Color3.fromRGB, Vector3.new, CFrame.new, CFrame.Angles, Enum.Material
+		local rnd, T, RAD = Random.new(), TIME.cooked, low and 14 or 16
+		local folder = Instance.new("Folder")
+		folder.Name = "UhCooked"
+		local ops, pool, reg = {}, {}, {}
+		local conn, cconn, anchor, lost
+		local shot, pi, burst = 0, 0, 0
+		local t0 = os.clock()
+		local nextShot = t0 + 0.9
+		local gp, bp = RaycastParams.new(), RaycastParams.new()
+		gp.FilterType, gp.RespectCanCollide, gp.FilterDescendantsInstances = Enum.RaycastFilterType.Exclude, true, {folder, me0, Env.Player.Character}
+		bp.FilterType, bp.FilterDescendantsInstances = Enum.RaycastFilterType.Exclude, {folder}
+
+		local function stop()
+			if conn then conn:Disconnect(); conn = nil end
+			if cconn then cconn:Disconnect(); cconn = nil end
+			pcall(function() folder:Destroy() end)
+			table.clear(ops); table.clear(pool); table.clear(reg)
+		end
+		fx.cooked = stop
+		expire("cooked", stop, T + 1)
+
+		local UNI, VEST, BLK, GLV = C3(38, 44, 52), C3(24, 27, 30), C3(14, 14, 16), C3(12, 12, 12)
+		local METAL, POLY, HELM = C3(30, 30, 33), C3(40, 42, 44), C3(30, 34, 28)
+
+		local function part(par, base, name, size, cf, col, mat, shape)
+			local p = Instance.new("Part")
+			p.Name, p.Size, p.Color, p.Material = name, size, col, mat or MT.SmoothPlastic
+			p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless, p.CastShadow = false, false, false, false, true, false
+			if shape then p.Shape = shape end
+			local w = Instance.new("Weld")
+			w.Part0, w.Part1, w.C0, w.Parent = base, p, cf, p
+			p.Parent = par
+			return p
+		end
+		local function em(par, dir, props)
+			local e = Instance.new("ParticleEmitter")
+			e.Rate, e.Enabled, e.EmissionDirection = 0, false, dir
+			for k, v in pairs(props) do e[k] = v end
+			e.Parent = par
+			return e
+		end
+
+		local function buildOp()
+			local m = Instance.new("Model")
+			m.Name = "SwatOperator"
+			local root = Instance.new("Part")
+			root.Name, root.Size, root.Transparency = "HumanoidRootPart", V3(2, 2, 1), 1
+			root.Anchored, root.CanCollide, root.CanTouch, root.CanQuery, root.CastShadow = true, false, false, false, false
+			root.Parent = m
+			m.PrimaryPart = root
+			local function P(...) return part(m, root, ...) end
+			-- legs, boots, knee pads, holster
+			for s = -1, 1, 2 do
+				P("Leg", V3(0.95, 2, 1), CF(s * 0.5, -2, 0), UNI)
+				P("Boot", V3(1, 0.6, 1.3), CF(s * 0.5, -2.8, -0.15), BLK, MT.Slate)
+				P("KneePad", V3(0.9, 0.55, 0.25), CF(s * 0.5, -1.55, -0.55), VEST)
+				P("ShoulderPad", V3(0.75, 0.35, 1.1), CF(s * 1.3, 1.0, 0), VEST)
+				P("EarPro", V3(0.25, 0.55, 0.5), CF(s * 0.75, 1.8, 0.05), BLK)
+			end
+			P("Holster", V3(0.35, 0.9, 0.5), CF(1.1, -1.45, -0.1), BLK)
+			-- uniform, plate carrier, pouches, belt, radio
+			P("Torso", V3(2, 2, 1), CF(), UNI)
+			P("Vest", V3(2.3, 1.75, 1.3), CF(0, 0.12, 0), VEST)
+			P("PlateF", V3(1.5, 1.25, 0.14), CF(0, 0.22, -0.72), BLK, MT.Metal)
+			local pb = P("PlateB", V3(1.5, 1.25, 0.14), CF(0, 0.22, 0.72), BLK, MT.Metal)
+			local sg = Instance.new("SurfaceGui")
+			sg.Face = Enum.NormalId.Back
+			local tl = Instance.new("TextLabel")
+			tl.Size, tl.BackgroundTransparency, tl.Text, tl.TextColor3, tl.Font, tl.TextScaled = UDim2.fromScale(1, 1), 1, "SWAT", C3(235, 235, 235), Enum.Font.GothamBlack, true
+			tl.Parent = sg
+			sg.Parent = pb
+			for i = -1, 1 do P("MagPouch", V3(0.4, 0.55, 0.26), CF(i * 0.5, -0.45, -0.86), C3(34, 36, 30)) end
+			P("Belt", V3(2.2, 0.32, 1.15), CF(0, -0.98, 0), BLK)
+			P("Radio", V3(0.32, 0.6, 0.24), CF(0.85, 0.65, -0.82), BLK)
+			P("Antenna", V3(0.07, 0.6, 0.07), CF(0.85, 1.2, -0.82), BLK)
+			P("Collar", V3(1.1, 0.35, 0.9), CF(0, 1.1, 0), VEST)
+			-- balaclava, ballistic visor, helmet, NVG mount
+			P("Head", V3(1.2, 1.2, 1.2), CF(0, 1.75, 0), BLK)
+			P("Visor", V3(1.05, 0.38, 0.08), CF(0, 1.82, -0.64), C3(16, 40, 52), MT.Glass)
+			P("Helmet", V3(1.55, 1.55, 1.55), CF(0, 2.3, 0.08), HELM, MT.SmoothPlastic, Enum.PartType.Ball)
+			P("HelmetBrim", V3(1.3, 0.14, 0.35), CF(0, 2.28, -0.72), HELM)
+			P("NVGMount", V3(0.4, 0.3, 0.3), CF(0, 2.55, -0.7), BLK)
+			-- aim group (arms + rifle) hangs off ONE weld that is pitched / recoiled each frame
+			local aim = Instance.new("Part")
+			aim.Name, aim.Size, aim.Transparency = "Aim", V3(0.2, 0.2, 0.2), 1
+			aim.Anchored, aim.CanCollide, aim.CanTouch, aim.CanQuery, aim.Massless, aim.CastShadow = false, false, false, false, true, false
+			local aimW = Instance.new("Weld")
+			aimW.Part0, aimW.Part1, aimW.C0, aimW.Parent = root, aim, CF(0, 1, 0), aim
+			aim.Parent = m
+			local function A(...) return part(m, aim, ...) end
+			local S, RO, K = 0.75, CF(0.38, -0.1, -1.75), ANG(0, math.rad(90), 0)
+			local function Rf(name, size, x, y, z, col, mat, rot, shape)
+				return A(name, size * S, RO * CF(x * S, y * S, z * S) * (rot or CF()), col, mat or MT.Metal, shape)
+			end
+			local up = Rf("Upper", V3(0.3, 0.3, 1.1), 0, 0.3, -0.05, METAL)
+			Rf("Lower", V3(0.28, 0.34, 1.0), 0, 0, 0, METAL)
+			Rf("ChargingHandle", V3(0.16, 0.08, 0.2), 0, 0.5, 0.5, BLK)
+			Rf("Handguard", V3(0.36, 0.36, 1.25), 0, 0.2, -1.1, POLY, MT.SmoothPlastic)
+			Rf("RailTop", V3(0.12, 0.06, 2.4), 0, 0.5, -0.45, BLK)
+			Rf("Barrel", V3(0.9, 0.13, 0.13), 0, 0.2, -2.1, BLK, MT.Metal, K, Enum.PartType.Cylinder)
+			Rf("FlashHider", V3(0.35, 0.2, 0.2), 0, 0.2, -2.65, BLK, MT.Metal, K, Enum.PartType.Cylinder)
+			Rf("Optic", V3(0.26, 0.28, 0.45), 0, 0.68, -0.2, BLK)
+			Rf("Lens", V3(0.2, 0.2, 0.03), 0, 0.7, -0.44, C3(150, 30, 30), MT.Glass)
+			Rf("FrontSight", V3(0.06, 0.3, 0.06), 0, 0.68, -1.5, BLK)
+			Rf("RearSight", V3(0.08, 0.2, 0.1), 0, 0.6, 0.6, BLK)
+			Rf("Magazine", V3(0.2, 0.8, 0.3), 0, -0.55, -0.2, C3(22, 22, 24), MT.Metal, ANG(math.rad(-8), 0, 0))
+			Rf("MagBase", V3(0.22, 0.08, 0.32), 0, -0.97, -0.13, BLK, MT.Metal, ANG(math.rad(-8), 0, 0))
+			Rf("PistolGrip", V3(0.2, 0.55, 0.26), 0, -0.4, 0.38, BLK, MT.SmoothPlastic, ANG(math.rad(20), 0, 0))
+			Rf("TriggerGuard", V3(0.05, 0.12, 0.3), 0, -0.22, 0.12, METAL)
+			Rf("BufferTube", V3(0.2, 0.2, 0.8), 0, 0.12, 0.95, METAL)
+			Rf("Stock", V3(0.24, 0.5, 0.7), 0, 0, 1.45, POLY, MT.SmoothPlastic)
+			Rf("CheekRest", V3(0.22, 0.14, 0.5), 0, 0.3, 1.4, BLK)
+			Rf("ButtPad", V3(0.26, 0.54, 0.1), 0, 0, 1.85, BLK)
+			Rf("Foregrip", V3(0.18, 0.55, 0.18), 0, -0.3, -1.25, BLK, MT.SmoothPlastic, ANG(math.rad(10), 0, 0))
+			Rf("WeaponLight", V3(0.16, 0.16, 0.45), 0.26, 0.2, -1.5, BLK)
+			Rf("LightLens", V3(0.12, 0.12, 0.03), 0.26, 0.2, -1.74, C3(255, 245, 210), MT.Neon)
+			Rf("Laser", V3(0.12, 0.12, 0.24), -0.24, 0.2, -1.5, BLK)
+			Rf("LaserDot", V3(0.05, 0.05, 0.03), -0.24, 0.2, -1.63, C3(255, 20, 20), MT.Neon)
+			local muz = Rf("Muzzle", V3(0.1, 0.1, 0.1), 0, 0.2, -2.95, METAL)
+			muz.Transparency = 1
+			local fl = Rf("Flash", V3(0.5, 0.5, 0.5), 0, 0.2, -3.1, C3(255, 200, 90), MT.Neon, nil, Enum.PartType.Ball)
+			fl.Transparency = 1
+			-- arms (sleeves, elbow pads, gloves) reaching the grip and the foregrip
+			local function limb(a, b, t) return A("Arm", V3(t, t, (b - a).Magnitude), CFrame.lookAt((a + b) / 2, b), UNI, MT.Fabric) end
+			local rs, re, hr = V3(1.25, -0.1, 0.1), V3(1.0, -0.95, -0.55), V3(0.38, -0.4, -1.47)
+			local ls, le, hl = V3(-1.25, -0.1, 0.1), V3(-0.55, -0.95, -1.3), V3(0.38, -0.38, -2.65)
+			limb(rs, re, 0.85); limb(re, hr, 0.75); limb(ls, le, 0.85); limb(le, hl, 0.75)
+			A("ElbowPad", V3(0.6, 0.6, 0.6), CF(re), VEST); A("ElbowPad", V3(0.6, 0.6, 0.6), CF(le), VEST)
+			A("Glove", V3(0.45, 0.45, 0.45), CF(hr), GLV); A("Glove", V3(0.45, 0.45, 0.45), CF(hl), GLV)
+			-- effects: flash + brief muzzle light, smoke, ejected brass
+			local o = {m = m, root = root, aimW = aimW, muz = muz, fl = fl, k = 0, pt = 0, flT = 0}
+			o.ef = em(muz, Enum.NormalId.Front, {Texture = "rbxasset://textures/particles/sparkles_main.dds", Color = ColorSequence.new(C3(255, 225, 130), C3(255, 120, 30)), Size = NumberSequence.new(1.4, 0), LightEmission = 1, Lifetime = NumberRange.new(0.05, 0.09), Speed = NumberRange.new(0, 3)})
+			o.es = em(muz, Enum.NormalId.Front, {Texture = "rbxasset://textures/particles/smoke_main.dds", Color = ColorSequence.new(C3(170, 170, 170)), Size = NumberSequence.new(0.4, 1.4), Transparency = NumberSequence.new(0.6, 1), Lifetime = NumberRange.new(0.4, 0.7), Speed = NumberRange.new(2, 5), Drag = 2, SpreadAngle = Vector2.new(20, 20)})
+			o.esh = em(up, Enum.NormalId.Right, {Color = ColorSequence.new(C3(210, 165, 60)), Size = NumberSequence.new(0.14), Lifetime = NumberRange.new(0.6, 0.9), Speed = NumberRange.new(9, 14), Acceleration = V3(0, -50, 0), SpreadAngle = Vector2.new(18, 18), Rotation = NumberRange.new(0, 360), RotSpeed = NumberRange.new(-400, 400)})
+			if not low then
+				local lt = Instance.new("PointLight")
+				lt.Color, lt.Brightness, lt.Range, lt.Enabled = C3(255, 170, 70), 3, 14, false
+				lt.Parent = muz
+				o.lt = lt
+			end
+			return o
+		end
+
+		local function place(c)
+			anchor = c
+			for _, o in ipairs(ops) do
+				local x, z = c.X + math.cos(o.a) * RAD, c.Z + math.sin(o.a) * RAD
+				local g = workspace:Raycast(V3(x, c.Y + 4, z), V3(0, -50, 0), gp)
+				o.pos = V3(x, (g and g.Position.Y or c.Y - 3) + 3.1, z)
+			end
+		end
+		local function pose(o, tp, dt)
+			o.root.CFrame = CFrame.lookAt(o.pos, V3(tp.X, o.pos.Y, tp.Z))
+			local d = tp - (o.pos + V3(0, 1, 0))
+			local want = math.clamp(math.atan2(d.Y, math.sqrt(d.X * d.X + d.Z * d.Z)), -0.9, 0.9)
+			o.pt += (want - o.pt) * math.min(1, dt * 12)
+			o.k = math.max(0, o.k - dt * 9)
+			o.aimW.C0 = CF(0, 1, 0) * ANG(o.pt + o.k * 0.07, 0, 0) * CF(0, 0, o.k * 0.16)
+		end
+		local function fire(o, t, tp, hum, me, rc)
+			local mp = o.muz.Position
+			local aimAt = tp + V3(rnd:NextNumber(-0.7, 0.7), rnd:NextNumber(-0.9, 0.9), rnd:NextNumber(-0.7, 0.7))
+			if rnd:NextNumber() < 0.45 then -- deliberate miss: the round passes the target
+				aimAt += V3(rnd:NextNumber(-1, 1), rnd:NextNumber(-0.4, 1), rnd:NextNumber(-1, 1)).Unit * rnd:NextNumber(3, 6)
+			end
+			local dir = (aimAt - mp).Unit
+			local res = workspace:Raycast(mp, dir * 300, bp)
+			local ep = res and res.Position or (mp + dir * 300)
+			shot += 1
+			if res and hum and COOKED_DMG > 0 and hum.Health > 0 and not reg[shot] and (res.Instance:IsDescendantOf(me) or (rc and res.Instance:IsDescendantOf(rc))) then
+				reg[shot] = true; reg[shot - 30] = nil -- one ray = at most one registered hit
+				hum:TakeDamage(COOKED_DMG)
+			end
+			pi = pi % #pool + 1
+			local tr, len = pool[pi], (ep - mp).Magnitude
+			tr.p.Size = V3(0.08, 0.08, len)
+			tr.p.CFrame = CFrame.lookAt(mp, ep) * CF(0, 0, -len / 2)
+			tr.p.Transparency, tr.t0 = 0.1, t
+			o.k, o.flT = 1, t + 0.05
+			o.fl.Transparency = 0
+			if o.lt then o.lt.Enabled = true end
+			o.ef:Emit(1); o.esh:Emit(1)
+			if shot % 2 == 0 then o.es:Emit(1) end
+		end
+		local function step(dt)
+			local t = os.clock()
+			local me, rc = myChar(), Env.Player.Character
+			local tr = me and (me:FindFirstChild("HumanoidRootPart") or me.PrimaryPart)
+			if not (tr and tr.Parent) then
+				lost = lost or t
+				if t - lost > 1.5 then stopFx("cooked") end -- target / character gone
+				return
+			end
+			lost = nil
+			local hum = rc and rc:FindFirstChildOfClass("Humanoid")
+			if t - t0 >= T or (hum and hum.Health <= 0) then return stopFx("cooked") end
+			local tp = tr.Position + V3(0, 0.6, 0)
+			if V3(tp.X - anchor.X, 0, tp.Z - anchor.Z).Magnitude > RAD * 2.2 then place(tr.Position) end
+			local go = t >= nextShot -- ONE synchronized clock: 4-round bursts, all five operators together
+			if go then
+				burst += 1
+				nextShot = t + (burst >= 4 and 0.6 or 0.11)
+				if burst >= 4 then burst = 0 end
+			end
+			for _, o in ipairs(ops) do
+				pose(o, tp, dt)
+				if go then fire(o, t, tp, hum, me, rc) end
+				if o.flT > 0 and t >= o.flT then
+					o.flT = 0
+					o.fl.Transparency = 1
+					if o.lt then o.lt.Enabled = false end
+				end
+			end
+			for _, p in ipairs(pool) do
+				if p.t0 >= 0 then
+					local k = (t - p.t0) / 0.07
+					if k >= 1 then p.t0, p.p.Transparency = -1, 1 else p.p.Transparency = 0.1 + 0.9 * k end
+				end
+			end
+		end
+
+		local okB = pcall(function()
+			local a0 = rnd:NextNumber(0, math.pi * 2)
+			for i = 1, 5 do
+				local o = buildOp()
+				o.a = a0 + (i - 1) * math.pi * 2 / 5
+				o.m.Parent = folder
+				ops[i] = o
+			end
+			for i = 1, low and 8 or 14 do
+				local p = Instance.new("Part")
+				p.Name, p.Material, p.Color, p.Transparency, p.Size = "Tracer", MT.Neon, C3(255, 214, 120), 1, V3(0.08, 0.08, 1)
+				p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.CastShadow = true, false, false, false, false
+				p.Parent = folder
+				pool[i] = {p = p, t0 = -1}
+			end
+			place(root0.Position)
+			local tp0 = root0.Position + V3(0, 0.6, 0)
+			for _, o in ipairs(ops) do pose(o, tp0, 1) end
+			folder.Parent = workspace
+		end)
+		if not okB then
+			toast("Cooked failed to build")
+			return stopFx("cooked")
+		end
+		cconn = Env.Player.CharacterAdded:Connect(function() stopFx("cooked") end) -- respawn: squad gone at once
+		local interval, acc = low and 1 / 30 or 0, 0
+		conn = RS.Heartbeat:Connect(function(dt)
+			acc += dt
+			if acc < interval then return end
+			local d = math.min(acc, 0.1)
+			acc = 0
+			if not pcall(step, d) then stopFx("cooked") end
+		end)
+	end
+
 	-- ===== recipient: entry point (called by ModTools for every queued command) =====
 	-- returns true when the command was one of the three effects (handled or rejected here), false for everything else
 	function F.Receive(c)
@@ -1214,6 +1485,9 @@ return function(Env, R)
 		elseif action == "domain" then
 			toast(sp.Name .. " activated Domain Expansion: Unlimited Void on you (" .. TIME.domain .. " s)")
 			domain()
+		elseif action == "cooked" then
+			toast(sp.Name .. " called a SWAT squad on you (" .. TIME.cooked .. " s)")
+			cooked()
 		else
 			toast(sp.Name .. " made you dizzy (" .. TIME.dizzy .. " s)")
 			dizzy()

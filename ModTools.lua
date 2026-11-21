@@ -7,7 +7,7 @@ return function(Env, R)
 	local HS, Players, RS = Env.HttpService, Env.Players, Env.RunService
 	local M = {Running = false}
 	local ACTIONS = {kill = true, deanimate = true, kick = true}
-	local FXA = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true, domain = true} -- handled by Env.Fx (VerifiedPlayerFeatures.lua)
+	local FXA = {bring = true, hallucinate = true, dizzy = true, silenthell = true, dropbomb = true, domain = true, cooked = true} -- handled by Env.Fx (VerifiedPlayerFeatures.lua)
 
 	function M.CanModerate()
 		return Env.Request ~= nil and R.RoleOf(Env.Player.UserId) ~= nil -- owner / co-owner / verified players: no key (the backend recognises their userId)
